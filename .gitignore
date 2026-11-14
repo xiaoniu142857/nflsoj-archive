@@ -16,4 +16,5 @@ wheels/
 .test-tmp/
 .probe/
 .probe_token
+.nflsoj/
 *.log
