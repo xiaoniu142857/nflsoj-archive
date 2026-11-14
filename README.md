@@ -217,7 +217,7 @@ nflsoj logout     # 清除本地登录凭据（做题标记与归档文件都保
 
 | 选项 | 说明 |
 |---|---|
-| `--data-dir PATH` | 数据目录（默认 `~/.nflsoj`） |
+| `--data-dir PATH` | 数据目录（默认 `~/.nflsoj`，可被环境变量 `NFLSOJ_DATA_DIR` 覆盖） |
 | `--api URL` | 站点 API 地址（默认 `https://nflsoi.cc:20035`） |
 | `--timeout N` | HTTP 超时秒数（默认 `30`） |
 | `--insecure` | 跳过 HTTPS 证书校验（代理 / 自签名证书环境用） |
@@ -236,6 +236,7 @@ nflsoj logout     # 清除本地登录凭据（做题标记与归档文件都保
 | 变量 | 作用 |
 |---|---|
 | `NFLSOJ_TOKEN` | `login` 时的默认 token（等价于 `--token`） |
+| `NFLSOJ_DATA_DIR` | 默认数据目录（优先级低于 `--data-dir`，高于 `~/.nflsoj`） |
 | `NO_COLOR` | 任意非空值即禁用彩色（遵循 [no-color.org](https://no-color.org) 约定） |
 | `NFLSOJ_WIDTH` / `COLUMNS` | 覆盖输出宽度（优先级低于 `--width`） |
 
@@ -244,6 +245,8 @@ nflsoj logout     # 清除本地登录凭据（做题标记与归档文件都保
 - 输出重定向到文件 / 管道（非 TTY）时，彩色与进度条会自动关闭，避免污染日志。
 - 终端的 `stdout` 编码无法表示 `─│✔○◐█░…` 等字符时，会自动退化为 ASCII 模式。
 - `--api` 只覆盖**本次运行**使用的地址；只有 `login` 和 `config --set-api` 会把它写进配置文件。
+- 需要写盘的命令（`login` / `logout` / `config` / `sync` / `mark` / `archive`）启动时会先试写数据目录；
+  不可写时立刻给出可操作提示并退出（不会先联网再在最后一步崩掉）。
 
 ---
 
@@ -875,7 +878,8 @@ nflsoj archive --all         # 首次建立本地 Markdown 存档
 
 ## 数据存储
 
-默认全部存放在 `~/.nflsoj/`（Windows 为 `C:\Users\<你>\.nflsoj\`），可用 `--data-dir` 更改。
+默认全部存放在 `~/.nflsoj/`（Windows 为 `C:\Users\<你>\.nflsoj\`），可用 `--data-dir`
+或环境变量 `NFLSOJ_DATA_DIR` 更改；`--data-dir` 优先级最高。
 所有 JSON 都采用「临时文件 + `os.replace` 原子替换」写入；在类 Unix 系统上还会把文件权限设为 `0600`。
 读取时兼容 UTF-8 BOM（`utf-8-sig`），手动用记事本改过 JSON 也不会解析失败。
 
@@ -1065,6 +1069,25 @@ Token 过期了。重新执行 `nflsoj login`，粘贴最新的 `session-swr` �
 
 不会。题面命中 `cache/statements/`（30 天）就不再请求；Markdown 内容没变就不重写文件，
 归档结束会打印「新增/更新 N 个文件，M 个文件内容未变」。
+
+**Q11：登录时报错「数据目录不可写：`C:\Users\<你>\.nflsoj`」（或 `PermissionError: ... config.json.tmp`）？**
+
+说明当前进程对 `~/.nflsoj` 没有写权限。常见于两种情况：目录被设成只读 / 被安全软件锁定，
+或者命令是在**受限沙箱终端**里跑的（这类终端通常只允许写工作区目录）。工具现在会在启动时
+先试写一次，直接给出可操作提示而不是抛 traceback。三种解法任选：
+
+```bash
+# 1) 换一个可写的数据目录（推荐放在工作区内）
+uv run nflsoj --data-dir .nflsoj login
+
+# 2) 用环境变量改默认目录（Windows PowerShell）
+$env:NFLSOJ_DATA_DIR = "D:\ojdata"
+
+# 3) 在普通终端（非沙箱）里运行，直接沿用默认的 ~/.nflsoj
+```
+
+> 换目录前如果想保留旧的做题标记，把旧的 `config.json` 与 `progress.json`
+> 复制到新目录即可（`progress.json` 格式 1.0 → 1.1 无需迁移）。
 
 ---
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as _dt
+import errno
 import gzip
 import http.client
 import io
@@ -37,6 +38,7 @@ import json
 import os
 import re
 import ssl
+import stat
 import sys
 import threading
 import time
@@ -50,9 +52,15 @@ __version__ = "1.1.0"
 
 DEFAULT_API = "https://nflsoi.cc:20035"
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".nflsoj")
+DATA_DIR_ENV = "NFLSOJ_DATA_DIR"
 CONTEST_PAGE_SIZE = 20          # 与站点 serverPreference.pagination.contestList 保持一致
 STATEMENT_CACHE_TTL = 30 * 86400   # 题目正文本地缓存有效期（秒）
 DEFAULT_WORKERS = 8             # 实测 8 并发最稳定（16 并发反而被站点拖慢）
+
+# 写盘失败时统一给出的可操作提示
+WRITE_HINT = ("该位置不可写：可能位于只读目录、被其他程序占用，"
+              "或当前终端运行在受限沙箱中。可换一个可写目录："
+              "nflsoj --data-dir <目录>，或设置环境变量 %s" % DATA_DIR_ENV)
 
 # ---------------------------------------------------------------------------
 # 状态定义
@@ -384,8 +392,9 @@ class Console:
         self.out(self.paint("  " + clean_text(text), "bblue", bold=True))
 
     def muted(self, text: str, indent: int = 6) -> None:
-        for line in wrap_display(clean_text(text), self.width - indent, " " * indent):
-            self.out(self.paint(line, "grey"))
+        pad = " " * max(0, indent)
+        for line in wrap_display(clean_text(text), max(10, self.width - len(pad))):
+            self.out(self.paint(pad + line, "grey"))
 
     def hint(self, text: str) -> None:
         """下一步建议（统一样式）。"""
@@ -821,6 +830,68 @@ class ApiError(Exception):
         self.hint = hint
 
 
+class StoreError(Exception):
+    """本地文件读写失败（只读目录、被占用、沙箱受限等）。"""
+
+    def __init__(self, message: str, path: str = "", hint: str = ""):
+        super().__init__(message)
+        self.message = message
+        self.path = path
+        self.hint = hint
+
+
+def _write_hint(exc) -> str:
+    if getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM):
+        return WRITE_HINT
+    return "请检查磁盘空间与路径是否合法，或改用 --data-dir 指定其他目录"
+
+
+def atomic_write_text(path: str, text: str) -> None:
+    """原子写入文本文件（临时文件 + os.replace），失败时抛 StoreError。
+
+    细节：
+      * 临时文件名带进程号，避免多个实例/上次残留的 .tmp 互相踩；
+      * 目标文件只读时先去掉只读属性再替换（Windows 上否则会 EACCES）；
+      * 任何失败都会清理临时文件，并给出可操作的中文提示而不是裸异常。
+    """
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            raise StoreError("无法创建目录：%s" % directory, directory,
+                             _write_hint(exc)) from exc
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        if os.path.exists(path):
+            try:
+                if not os.access(path, os.W_OK):
+                    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise StoreError("无法写入文件：%s（%s）" % (path, getattr(exc, "strerror", None) or exc),
+                         path, _write_hint(exc)) from exc
+
+
+def resolve_data_dir(cli_value=None) -> str:
+    """数据目录优先级：--data-dir > 环境变量 NFLSOJ_DATA_DIR > ~/.nflsoj。"""
+    raw = cli_value or os.environ.get(DATA_DIR_ENV) or DEFAULT_DATA_DIR
+    return os.path.abspath(os.path.expanduser(str(raw)))
+
+
 STATUS_HINT = {
     400: "请求参数有误（站点 API 可能已升级，请检查工具版本）",
     401: "登录状态无效或已过期，请重新执行 login 命令",
@@ -837,7 +908,7 @@ STATUS_HINT = {
 def report_error(console: "Console", err: ApiError) -> int:
     console.error(err.message)
     if err.hint:
-        console.muted("      " + err.hint)
+        console.muted(err.hint)
     return 1
 
 
@@ -1313,17 +1384,37 @@ class Store:
             return default
 
     def _write_json(self, path, payload) -> None:
-        self._ensure_dir(os.path.dirname(path))
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-        os.replace(tmp, path)
+        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         if os.name != "nt":
             try:
                 os.chmod(path, 0o600)
             except OSError:
                 pass
+
+    def writable(self) -> bool:
+        """真正试写一次，判断数据目录能否保存（比 os.access 可靠）。"""
+        probe_dir = self.data_dir
+        while probe_dir and not os.path.isdir(probe_dir):
+            if os.path.exists(probe_dir):
+                return False          # 路径上有一层是同名文件，目录永远建不出来
+            parent = os.path.dirname(probe_dir)
+            if parent in ("", probe_dir):
+                return False
+            probe_dir = parent
+        if not probe_dir or not os.path.isdir(probe_dir):
+            return False
+        probe = os.path.join(probe_dir, ".nflsoj-write-test-%d" % os.getpid())
+        try:
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("ok")
+            os.remove(probe)
+            return True
+        except OSError:
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+            return False
 
     def load(self) -> None:
         self.config = self._read_json(self.config_path, {})
@@ -1523,7 +1614,10 @@ def resolve_username(store: Store, console: Console, client: Client, online: boo
     username = str(user.get("username") or user.get("id") or "unknown")
     if store.config.get("username") != username:
         store.config["username"] = username
-        store.save_config()
+        try:
+            store.save_config()
+        except StoreError as exc:
+            console.warn("用户名未能写回配置：%s" % exc.message)
     return username
 
 
@@ -1885,9 +1979,6 @@ def md_link(text, url) -> str:
 
 def write_if_changed(path: str, content: str) -> str:
     """内容有变化才写盘（保持文件 mtime 稳定），返回 written / unchanged。"""
-    directory = os.path.dirname(path)
-    if directory and not os.path.isdir(directory):
-        os.makedirs(directory, exist_ok=True)
     old = None
     try:
         with open(path, "r", encoding="utf-8", newline="") as handle:
@@ -1896,10 +1987,7 @@ def write_if_changed(path: str, content: str) -> str:
         old = None
     if old == content:
         return "unchanged"
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(content)
-    os.replace(tmp, path)
+    atomic_write_text(path, content)
     return "written"
 
 
@@ -2384,7 +2472,10 @@ def _ensure_problems(store: Store, username: str, console: Console, entry: dict,
         report_error(console, exc)
         return None
     entry = store.upsert_contest(username, meta, problems)
-    store.save_progress()
+    try:
+        store.save_progress()
+    except StoreError as exc:
+        console.warn("题目列表已载入，但未能写入缓存：%s" % exc.message)
     return entry
 
 
@@ -2672,7 +2763,10 @@ def cmd_contests(args, store: Store, console: Console) -> int:
             progress.close()
         for contest in fetched:
             store.upsert_contest(username, contest, None)
-        store.save_progress()
+        try:
+            store.save_progress()
+        except StoreError as exc:
+            console.warn("列表已显示，但未能写入本地缓存：%s" % exc.message)
         contests = store.all_contests(username)
         source = "实时请求"
     client.close()
@@ -3248,11 +3342,7 @@ def cmd_export(args, store: Store, console: Console) -> int:
     text = buffer.getvalue()
     if args.output and args.output != "-":
         path = os.path.abspath(args.output)
-        directory = os.path.dirname(path)
-        if directory and not os.path.isdir(directory):
-            os.makedirs(directory, exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
+        atomic_write_text(path, text)
         console.ok("已导出到 %s" % path)
         console.muted("共 %d 场比赛" % len(contests))
     else:
@@ -3512,6 +3602,10 @@ EPILOG = """示例：
   离线
     nflsoj --offline contests                    只用本地缓存，不发任何请求
 
+  数据目录（默认 $NFLSOJ_DATA_DIR 或 ~/.nflsoj）
+    nflsoj --data-dir D:\\ojdata login           临时指定数据目录
+    set NFLSOJ_DATA_DIR=D:\\ojdata               设置默认数据目录（Windows PowerShell：$env:NFLSOJ_DATA_DIR=...）
+
 数据存储：%s
 """ % DEFAULT_DATA_DIR
 
@@ -3521,7 +3615,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 若用 None/False 作默认值，`nflsoj --api X contests` 中的 --api 会被子命令覆盖掉。
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", default=argparse.SUPPRESS, metavar="PATH",
-                        help="数据目录（默认 %s）" % DEFAULT_DATA_DIR)
+                        help="数据目录（默认环境变量 %s，否则 %s）" % (DATA_DIR_ENV, DEFAULT_DATA_DIR))
     common.add_argument("--api", default=argparse.SUPPRESS, metavar="URL",
                         help="站点 API 地址（默认 %s）" % DEFAULT_API)
     common.add_argument("--timeout", type=int, default=argparse.SUPPRESS, metavar="N",
@@ -3560,10 +3654,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cookie", help="直接提供浏览器 Cookie 串")
     p.add_argument("-u", "--username", help="用户名")
     p.add_argument("-p", "--password", help="密码")
-    p.set_defaults(handler=cmd_login)
+    p.set_defaults(handler=cmd_login, writes=True)
 
     p = sub.add_parser("logout", parents=[common], help="清除本地登录凭据")
-    p.set_defaults(handler=cmd_logout)
+    p.set_defaults(handler=cmd_logout, writes=True)
 
     p = sub.add_parser("whoami", parents=[common], help="显示当前登录状态（联网校验）")
     p.set_defaults(handler=cmd_whoami)
@@ -3572,7 +3666,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--set-api", metavar="URL", help="设置站点 API 地址")
     p.add_argument("--set-archive-dir", metavar="DIR", help="设置默认归档目录")
     p.add_argument("--clear", action="store_true", help="清除登录凭据")
-    p.set_defaults(handler=cmd_config)
+    p.set_defaults(handler=cmd_config, writes=True)
 
     p = sub.add_parser("sync", parents=[common], help="同步比赛与题目列表",
                        description="同步比赛列表与每场比赛的题目。默认增量：连续两页都已同步即停止，"
@@ -3586,7 +3680,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="强制重新拉取已有比赛的题目")
     p.add_argument("--full", dest="incremental", action="store_false",
                    help="关闭增量模式，完整遍历所有分页")
-    p.set_defaults(handler=cmd_sync, incremental=True)
+    p.set_defaults(handler=cmd_sync, incremental=True, writes=True)
 
     p = sub.add_parser("contests", parents=[common], aliases=["ls"], help="列出比赛",
                        description="列出比赛（默认读本地缓存，--live 从服务器刷新）。")
@@ -3618,7 +3712,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clear", action="store_true", help="清除标记")
     p.add_argument("--next", action="store_true", help="在 未完成→正在做→已完成 间循环")
     p.add_argument("--refresh", action="store_true", help="先刷新题目列表")
-    p.set_defaults(handler=cmd_mark)
+    p.set_defaults(handler=cmd_mark, writes=True)
 
     p = sub.add_parser("stats", parents=[common], aliases=["st"], help="做题情况统计（本地）")
     p.add_argument("--contest", nargs="*", metavar="SPEC", help="只统计指定比赛（ID 或名称）")
@@ -3661,7 +3755,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="并发抓取题面的线程数（默认 %d）" % DEFAULT_WORKERS)
     p.add_argument("--open", action="store_true", help="归档完成后打开总目录")
     p.add_argument("--json", action="store_true", help="以 JSON 输出归档结果")
-    p.set_defaults(handler=cmd_archive)
+    p.set_defaults(handler=cmd_archive, writes=True)
 
     return parser
 
@@ -3700,18 +3794,33 @@ def main(argv=None) -> int:
     console = Console(color=color, ascii_only=ascii_only,
                       width=getattr(args, "width", None),
                       progress=not getattr(args, "no_progress", False))
-    data_dir = os.path.abspath(os.path.expanduser(
-        getattr(args, "data_dir", None) or DEFAULT_DATA_DIR))
+    data_dir = resolve_data_dir(getattr(args, "data_dir", None))
     store = Store(data_dir)
     store.load()
     # --api 仅覆盖本次运行使用的地址（login / config 会显式写入配置）
     store.api_override = (getattr(args, "api", None) or "").rstrip("/")
+
+    # 需要写盘的命令先探一次数据目录，避免做完网络请求才在最后一步崩掉
+    if getattr(args, "writes", False) and not store.writable():
+        console.error("数据目录不可写：%s" % store.data_dir)
+        console.muted("该目录可能只读、被其他程序占用，或当前终端运行在受限沙箱中")
+        console.muted("换一个可写目录后重试：")
+        console.muted("nflsoj --data-dir <目录> %s" % (getattr(args, "command", "") or ""),
+                      indent=8)
+        console.muted("或设置环境变量 %s 指向可写目录" % DATA_DIR_ENV)
+        console.muted("只读命令（contests / problems / stats / export / open）不受影响")
+        return 1
 
     handler = getattr(args, "handler", None) or cmd_dashboard
     try:
         return handler(args, store, console)
     except ApiError as exc:
         return report_error(console, exc)
+    except StoreError as exc:
+        console.error(exc.message)
+        if exc.hint:
+            console.muted(exc.hint)
+        return 1
     except KeyboardInterrupt:
         console.blank()
         console.warn("已取消")
@@ -3722,9 +3831,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-
-
-
-

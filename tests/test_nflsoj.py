@@ -5,9 +5,11 @@
 """
 
 import io
+import errno
 import json
 import os
 import shutil
+import stat
 import sys
 import time
 import unittest
@@ -656,6 +658,126 @@ class ExporterTests(unittest.TestCase):
                  "tags": ["a", "b"], "state": core.STATE_DONE}]}]))
         self.assertEqual(rows[0]["state_label"], "已完成")
         self.assertEqual(rows[0]["tags"], "a b")
+
+
+class AtomicWriteTests(TmpCase):
+    def test_writes_text(self):
+        path = os.path.join(self.tmp, "sub", "a.txt")
+        core.atomic_write_text(path, "hello\n")
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "hello\n")
+
+    def test_overwrites_readonly_file(self):
+        path = os.path.join(self.tmp, "a.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("old")
+        os.chmod(path, stat.S_IREAD)          # 设为只读
+        core.atomic_write_text(path, "new")
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "new")
+        os.chmod(path, stat.S_IWRITE)
+
+    def test_permission_error_becomes_store_error(self):
+        path = os.path.join(self.tmp, "a.txt")
+        original = os.replace
+
+        def boom(src, dst):
+            raise PermissionError(errno.EACCES, "拒绝访问", dst)
+
+        os.replace = boom
+        try:
+            with self.assertRaises(core.StoreError) as ctx:
+                core.atomic_write_text(path, "x")
+        finally:
+            os.replace = original
+        self.assertIn(path, ctx.exception.message)
+        self.assertIn("--data-dir", ctx.exception.hint)
+        # 失败后不应留下临时文件
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.endswith(".tmp")], [])
+
+    def test_directory_creation_failure_is_store_error(self):
+        file_path = os.path.join(self.tmp, "afile")
+        with open(file_path, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        with self.assertRaises(core.StoreError):
+            core.atomic_write_text(os.path.join(file_path, "sub", "a.txt"), "x")
+
+    def test_store_save_config_reports_store_error(self):
+        store = core.Store(os.path.join(self.tmp, "data"))
+        original = os.replace
+
+        def boom(src, dst):
+            raise PermissionError(errno.EACCES, "拒绝访问", dst)
+
+        os.replace = boom
+        try:
+            with self.assertRaises(core.StoreError):
+                store.save_config()
+        finally:
+            os.replace = original
+
+    def test_store_writable_probe(self):
+        store = core.Store(os.path.join(self.tmp, "data"))
+        self.assertTrue(store.writable())
+        # 探针不应留下文件
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_store_writable_when_parent_is_file(self):
+        file_path = os.path.join(self.tmp, "afile")
+        with open(file_path, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        self.assertFalse(core.Store(os.path.join(file_path, "data")).writable())
+
+
+class DataDirTests(unittest.TestCase):
+    def test_cli_value_wins(self):
+        self.assertEqual(core.resolve_data_dir(os.path.join("x", "y")),
+                         os.path.abspath(os.path.join("x", "y")))
+
+    def test_env_var(self):
+        old = os.environ.get(core.DATA_DIR_ENV)
+        os.environ[core.DATA_DIR_ENV] = os.path.join(os.getcwd(), "envdata")
+        try:
+            self.assertEqual(core.resolve_data_dir(), os.path.abspath(os.path.join(os.getcwd(), "envdata")))
+        finally:
+            if old is None:
+                os.environ.pop(core.DATA_DIR_ENV, None)
+            else:
+                os.environ[core.DATA_DIR_ENV] = old
+
+    def test_default_when_unset(self):
+        old = os.environ.pop(core.DATA_DIR_ENV, None)
+        try:
+            self.assertEqual(core.resolve_data_dir(), os.path.abspath(core.DEFAULT_DATA_DIR))
+        finally:
+            if old is not None:
+                os.environ[core.DATA_DIR_ENV] = old
+
+
+class WriteGuardTests(TmpCase):
+    """不能写盘时，命令应给出友好提示而不是抛 traceback。"""
+
+    API = "http://127.0.0.1:9"      # 不可达地址：若守卫失效也不会打到真实站点
+
+    def _blocked(self) -> str:
+        blocker = os.path.join(self.tmp, "blocked")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        return os.path.join(blocker, "data")
+
+    def test_login_refuses_unwritable_data_dir(self):
+        code = core.main(["--api", self.API, "--data-dir", self._blocked(),
+                          "login", "-u", "u", "-p", "p"])
+        self.assertEqual(code, 1)
+
+    def test_sync_refuses_unwritable_data_dir(self):
+        code = core.main(["--api", self.API, "--data-dir", self._blocked(), "sync"])
+        self.assertEqual(code, 1)
+
+    def test_readonly_command_does_not_crash(self):
+        # stats 不需要写盘：数据目录不可写时也应正常给出「没有账号」而不是 traceback
+        code = core.main(["--api", self.API, "--data-dir", self._blocked(), "stats"])
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":
