@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.uv-cache/
+.uv-tools/
+
+# 本地数据 / 临时目录（测试与调试产物）
+.testdata*/
+.test-tmp/
+.probe/
+.probe_token
+*.log
