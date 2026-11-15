@@ -1072,9 +1072,12 @@ Token 过期了。重新执行 `nflsoj login`，粘贴最新的 `session-swr` �
 
 **Q11：登录时报错「数据目录不可写：`C:\Users\<你>\.nflsoj`」（或 `PermissionError: ... config.json.tmp`）？**
 
-说明当前进程对 `~/.nflsoj` 没有写权限。常见于两种情况：目录被设成只读 / 被安全软件锁定，
-或者命令是在**受限沙箱终端**里跑的（这类终端通常只允许写工作区目录）。工具现在会在启动时
-先试写一次，直接给出可操作提示而不是抛 traceback。三种解法任选：
+说明当前进程对 `~/.nflsoj` 没有写权限。常见的两种原因：
+
+1. **命令是在受限沙箱终端里跑的**（这类终端只允许写工作区目录）；
+2. **`~/.nflsoj` 被设成了只读**，或被安全软件锁定。
+
+工具会在启动时先试写一次，直接给出可操作提示而不是抛 traceback。三种解法任选：
 
 ```bash
 # 1) 换一个可写的数据目录（推荐放在工作区内）
@@ -1088,6 +1091,41 @@ $env:NFLSOJ_DATA_DIR = "D:\ojdata"
 
 > 换目录前如果想保留旧的做题标记，把旧的 `config.json` 与 `progress.json`
 > 复制到新目录即可（`progress.json` 格式 1.0 → 1.1 无需迁移）。
+
+**Q12：明明在普通终端里，`uv run nflsoj login` 还是写不了 `~/.nflsoj`？**
+
+看进程的**完整性级别**。Windows 有一条规则：从带 Low 完整性标签（Low IL）的
+**可执行文件**启动的进程，本身也会是 Low IL，而 Low IL 进程无法写入 Medium IL 的位置
+（`C:\Users\<你>\...` 通常就是），所以只有 `%TEMP%` 和工作区能写。
+
+典型触发场景：`.venv` 是在某个沙箱终端里 `uv sync` 出来的，里面的 `python.exe`
+被标成了 Low IL。判断方法（在出问题的终端里）：
+
+```powershell
+# 列出 python.exe 的完整性标签；显示 Low 就是它
+icacls .venv\Scripts\python.exe
+# 或者直接看进程的令牌
+whoami /groups | Select-String "Mandatory Level"
+```
+
+修复（任选其一）：
+
+```powershell
+# A. 普通权限：删掉重建。注意要在"没有 Low 标签"的普通终端里执行
+Remove-Item .venv -Recurse -Force
+uv sync
+
+# B. 管理员终端：直接把工作区和 venv 的标签抬到 Medium
+icacls . /setintegritylevel Medium
+icacls . /setintegritylevel Medium /T /C      # 递归（需要管理员）
+
+# C. 不想动权限：用工作区外的解释器跑（本项目零依赖，不需要 venv）
+C:\Users\<你>\.local\bin\python.exe src\nflsoj_archive\nflsoj.py login
+```
+
+> 判断"标签是不是来自目录"的小技巧：把一个正常（Medium）的 `python.exe`
+> 复制进工作区再运行，如果它变成 Low，说明是目录带着 Low 标签，从里面启动的任何
+> 程序都会被降级——这时用 A/B 修目录，或直接用 C。
 
 ---
 
