@@ -1,23 +1,31 @@
-# nflsoj — NFLSOJ 命令行工具
+# nflsoj / hydrooj — OJ 命令行工具集
 
-> 同步 [NFLSOJ](https://nflsoi.cc)（`nflsoi.cc`）的比赛与题目、管理做题进度、
-> 在终端里统计完成度，并把比赛首页与题面归档成本地 Markdown。
+> 同步 OJ 的比赛与题目、管理做题进度、在终端里统计完成度，
+> 并把比赛首页与题面归档成本地 Markdown。
 
-`nflsoj` 是一个**零第三方依赖**（仅 Python 标准库）的命令行工具。它直接调用 NFLSOJ 的
-JSON REST API（`<base>/api/...`），把数据缓存到本地，让你不必打开浏览器就能浏览比赛、
-题单、标记进度；需要长期保存时，再用 `archive` 把整场比赛导出成可直接用
-Obsidian / Typora / VS Code 阅读的 Markdown 文档。
+本仓库提供**两个前端完全一致**的命令行工具，分别对接两套不同的 OJ：
+
+| 工具 | 对接站点 | 实现基础 | 默认数据目录 |
+|---|---|---|---|
+| **`nflsoj`** | ports.cc / NFLSOJ（`https://nflsoi.cc:20035`） | 站点私有 JSON REST API（`/api/...`） | `~/.nflsoj` |
+| **`hydrooj`** | 基于 **Hydro v4.x** 搭建的 OJ（默认 `http://nflsoi.cc:10611`） | Hydro 的 JSON 视图（`Accept: application/json`） | `~/.hydrooj` |
+
+两者共用同一套终端渲染层、存储层与 Markdown 归档渲染器（`hydrooj` 直接复用
+`nflsoj_archive.nflsoj` 里的实现），因此配色、表格、进度条、命令名、选项、提示语
+和归档目录结构**完全相同**；差别只在「怎么跟服务器说话」和「ID 长什么样」。
+
+`nflsoj` 的详细文档见下文；Hydro 版的差异与用法见 [Hydro 版：hydrooj](#hydro-版hydrooj)。
 
 | 项目 | 值 |
 |---|---|
-| 当前版本 | `1.1.0` |
+| 当前版本 | `1.2.0` |
 | 许可证 | [GNU General Public License v3.0](#许可) |
 | 依赖 | 仅 Python 标准库，无需 `pip install` 任何包 |
 | Python | `pyproject.toml` 声明 `requires-python = ">=3.14"` |
-| 包入口 | `src/nflsoj_archive/`（`nflsoj` / `nflsoj-archive` 两个命令，或 `python -m nflsoj_archive`） |
-| 实现 | 全部逻辑集中在 `src/nflsoj_archive/nflsoj.py`（约 3600 行） |
-| 默认数据目录 | `~/.nflsoj`（Windows：`C:\Users\你的用户名\.nflsoj`） |
-| 默认站点 API | `https://nflsoi.cc:20035` |
+| 包入口 | `src/nflsoj_archive/` 与 `src/hydrooj_archive/` |
+| 控制台命令 | `nflsoj`、`nflsoj-archive`、`hydrooj`、`hydrooj-archive`，或 `python -m nflsoj_archive` / `python -m hydrooj_archive` |
+| 实现 | `src/nflsoj_archive/nflsoj.py`（共享前端 + NFLSOJ 后端）、`src/hydrooj_archive/hydrooj.py`（Hydro 后端） |
+| 默认站点 | nflsoj：`https://nflsoi.cc:20035`；hydrooj：`http://nflsoi.cc:10611` |
 
 ---
 
@@ -50,6 +58,7 @@ Obsidian / Typora / VS Code 阅读的 Markdown 文档。
 - [数据存储](#数据存储)
 - [站点 API 说明](#站点-api-说明)
 - [常见问题（FAQ）](#常见问题faq)
+- [Hydro 版：hydrooj](#hydro-版hydrooj)
 - [项目结构](#项目结构)
 - [贡献](#贡献)
 - [许可](#许可)
@@ -76,6 +85,9 @@ Obsidian / Typora / VS Code 阅读的 Markdown 文档。
 - **健壮性**：5xx / 429 自动重试（指数退避）、超时与证书错误的中文提示、原子写入本地 JSON、
   归档时内容未变则不重写文件。
 
+> 以上特性对 **`hydrooj`**（Hydro 版）同样成立；Hydro 特有的差异见
+> [Hydro 版：hydrooj](#hydro-版hydrooj)。
+
 ---
 
 ## 环境要求
@@ -100,45 +112,53 @@ cd nflsoj-archive
 
 uv sync                       # 按 pyproject.toml 创建虚拟环境并安装本项目
 uv run nflsoj --version       # 输出：nflsoj 1.1.0
+uv run hydrooj --version      # 输出：hydrooj 1.2.0
 uv run nflsoj --help
+uv run hydrooj --help
 ```
 
-`uv sync` 会注册两个等价的控制台命令：
+`uv sync` 会注册四个控制台命令：
 
 | 命令 | 说明 |
 |---|---|
-| `nflsoj` | 主命令 |
+| `nflsoj` | NFLSOJ 版主命令 |
 | `nflsoj-archive` | 同一入口的别名（便于与项目名对应） |
+| `hydrooj` | Hydro 版主命令 |
+| `hydrooj-archive` | Hydro 版的别名 |
 
 也可以直接激活虚拟环境后使用：
 
 ```bash
 uv run python -m nflsoj_archive --help   # 模块入口，等价于 nflsoj
+uv run python -m hydrooj_archive --help  # 模块入口，等价于 hydrooj
 ```
 
 ### 方式二：直接用 python 运行（不安装）
 
-`nflsoj.py` 自带可执行头，零依赖，克隆下来就能跑：
+两个脚本都自带可执行头，零依赖，克隆下来就能跑：
 
 ```bash
 python src/nflsoj_archive/nflsoj.py --help
+python src/hydrooj_archive/hydrooj.py --help
 
 # Linux / macOS 还可以：
-chmod +x src/nflsoj_archive/nflsoj.py
-./src/nflsoj_archive/nflsoj.py --help
+chmod +x src/nflsoj_archive/nflsoj.py src/hydrooj_archive/hydrooj.py
+./src/hydrooj_archive/hydrooj.py --help
 ```
 
-> 下文所有示例都用 `nflsoj` 代指 `uv run nflsoj` 或
-> `python src/nflsoj_archive/nflsoj.py`，两者行为完全一致。
+> 下文所有示例都用 `nflsoj` / `hydrooj` 代指 `uv run ...` 或 `python src/.../xxx.py`，
+> 两者行为完全一致。
 
 可选：为方便日常使用，可以建别名或软链接：
 
 ```bash
 # Linux / macOS
 alias nflsoj='python /path/to/nflsoj-archive/src/nflsoj_archive/nflsoj.py'
+alias hydrooj='python /path/to/nflsoj-archive/src/hydrooj_archive/hydrooj.py'
 
 # Windows PowerShell
 Set-Alias nflsoj "python D:\path\to\nflsoj-archive\src\nflsoj_archive\nflsoj.py"
+Set-Alias hydrooj "python D:\path\to\nflsoj-archive\src\hydrooj_archive\hydrooj.py"
 ```
 
 ---
@@ -820,7 +840,7 @@ nflsoj --offline export -o 记录.md
 | 增量同步 | 已有 `syncedAt` 的比赛跳过详情；连续两页全已同步即停止翻页 | 日常同步通常只发几页列表请求，而不是全量 |
 | 流水线 | 列表分页与详情抓取并行推进 | 总耗时 ≈ max(列表请求, 详情请求)，而不是两者相加 |
 | 题面缓存 | `cache/statements/<题目ID>.json`，30 天 | 重复归档不再请求题面 |
-| 内容未变不写盘 | `write_if_changed` | 归档重跑几乎不产生磁盘写入与 mtime 抖动 |
+| 内容未变不写盘 | `write_if_changed` + 沿用已有 `archived_at` | 重复归档 0 写入、0 题面请求，mtime 不抖动 |
 | 避免多余会话校验 | 本地已有账号名时不再联网确认身份 | 每次命令省掉约 2–3 秒的 `getSessionInfo` |
 
 **首次全量同步 vs 日常增量同步**（量级示意，实际取决于比赛总数与网络）：
@@ -839,9 +859,36 @@ nflsoj --offline export -o 记录.md
 - 网络慢 / 代理环境用 `--timeout 60`。
 - 只想看本地数据时加 `--offline`，可以确保不会因为一个手误触发整轮同步。
 
+**`hydrooj`（Hydro 站）实测**（本机 + 默认 6 并发，站点在本机附近、单请求约 10–50 ms）：
+
+| 场景 | 耗时 |
+|---|---|
+| 本地命令：`stats` / `export` / 缓存的 `contests`、`problems` | 约 0.3–0.5 s（含 Python 启动） |
+| `contests --live --limit 5` | 约 0.5 s |
+| `sync --limit 60`（60 场 / 252 题） | 约 1 s（另有 2.5 s 进程与首次握手） |
+| 增量 `sync`（前两页已同步即停） | 约 0.5 s |
+| `archive` 5 场 15 题（含抓 15 份题面） | 约 3.5 s |
+| 重复 `archive`（题面缓存命中、内容未变） | 约 1 s，**0 个文件被重写** |
+
+> Hydro 站的网关会随机返回 503 拦截页，工具会自动退避重试，因此偶发的额外耗时属正常现象。
+
 ---
 
 ## 从 1.0 升级
+
+### 1.1 → 1.2
+
+1.2.0 是**纯增量**版本，`nflsoj` 的命令与行为不变（旧数据、旧脚本可继续用）：
+
+| 变更 | 1.1 | 1.2 |
+|---|---|---|
+| Hydro 版 | 无 | 新增 `hydrooj`（别名 `hydrooj-archive`），对接 Hydro v4.x，前端与 `nflsoj` 完全一致 |
+| 控制台命令 | `nflsoj` / `nflsoj-archive` | 增加 `hydrooj` / `hydrooj-archive` |
+| 共享层 | `nflsoj.py` 自带全部逻辑 | `render_*` / `print_contest_header` 增加 `link_builder` / `generator` / `source_url` 可选参数，供 Hydro 复用 |
+| 归档时间戳 | 每次归档刷新 `archived_at`，导致重复归档总是重写文件 | **沿用已有文件的 `archived_at`**，重复归档真正 0 写入；`--force` 才刷新 |
+| 测试 | 96 个 | 160 个（新增 64 个 Hydro 用例） |
+
+### 1.0 → 1.1
 
 1.1.0 与 1.0.x 的主要差异（**行为变更请重点看第一条**）：
 
@@ -1129,39 +1176,187 @@ C:\Users\<你>\.local\bin\python.exe src\nflsoj_archive\nflsoj.py login
 
 ---
 
+## Hydro 版：hydrooj
+
+`hydrooj` 是同一项目里的第二个工具，对接**基于 Hydro v4.x 搭建**的 OJ
+（默认 `http://nflsoi.cc:10611`，可用 `--api` 或 `config --set-api` 指向别的 Hydro 站点）。
+
+**前端与功能同 `nflsoj` 完全一致**：同一套配色、表格、进度条、徽标、命令名、选项、
+提示语、归档目录结构与 Markdown 模板。只有下面这些地方不同。
+
+### 与 nflsoj 的差异
+
+| 项目 | `nflsoj` | `hydrooj` |
+|---|---|---|
+| 站点 | `https://nflsoi.cc:20035`（私有 API） | `http://nflsoi.cc:10611`（Hydro JSON 视图） |
+| 数据获取 | `<base>/api/...` + Bearer Token | `GET <path>` 加 `Accept: application/json` + 会话 Cookie |
+| 登录 | Token / Cookie / 用户名密码 | **用户名密码**（自建 Cookie 会话）或直接粘贴 Cookie |
+| 凭据形式 | `token` + `cookie` | `sid` / `sid.sig` 会话 Cookie |
+| 比赛 ID | 纯数字（如 `2643`） | 24 位十六进制（如 `6a323c90c9f0ca7cf29b5b0c`） |
+| 表格里的 ID | 完整 ID | **前 8 位短 ID**（输入时用完整 ID 或唯一前缀） |
+| 题目链接 | `/c/<cid>/p/<题号>` | `/p/<pid>?tid=<cid>` |
+| 赛制显示 | `mode` 原值 | `rule` 映射成 `IOI` / `ACM` / `OI` / `Ledo`… |
+| 题面来源 | `statement` 字段（Markdown） | `pdoc.content` → `{"zh": "..."}`（Markdown） |
+| 默认数据目录 | `~/.nflsoj` | `~/.hydrooj` |
+| 默认环境变量 | `NFLSOJ_DATA_DIR` | `HYDROOJ_DATA_DIR` |
+| 默认并发 | 8 | 6（站点有随机网关拦截，不宜开太高） |
+
+### 快速开始
+
+```bash
+hydrooj login                      # 交互式：用户名密码（推荐）或粘贴 Cookie
+hydrooj sync                       # 同步比赛与题目（增量）
+hydrooj contests                   # 比赛列表（显示短 ID 与完成进度）
+hydrooj problems 6a323c90          # 用短 ID 前缀直接打开某场比赛
+hydrooj mark 6a323c90 1 2 3        # 三道题一次标记为已完成
+hydrooj archive --all              # 比赛首页 + 题面 → 本地 Markdown
+hydrooj stats                      # 做题统计（纯本地）
+```
+
+### 登录
+
+```bash
+hydrooj login                                  # 交互式
+hydrooj login -u yangjinhua -p 密码             # 直接用户名密码
+hydrooj login --cookie "sid=...; sid.sig=..."  # 用浏览器里的会话
+```
+
+> Hydro 的登录是**服务端表单**：必须先建立访客会话（`GET /login` 拿到 `sid`），
+> 再 `POST` 用户名密码。工具内部用一个独立 `CookieJar` 完成这两步，成功后把
+> `sid` / `sid.sig` 存进 `config.json`，之后的请求直接复用这套 Cookie。
+>
+> 用户名密码错误时站点返回 `403` 且页面含「密码错误」，工具会明确提示；
+> 若被风控拦住则提示改用 Cookie 登录。
+
+### 网关随机拦截（重要）
+
+该站点的网关会**随机**返回 `503` 并附带一个英文的 “Web Access blocked” 页面
+（实测约每 3 次请求就有 1 次）。这不是登录失效，也不是站点挂了。工具的处理：
+
+- 识别响应体里的 `Web Access blocked` / `Blocked Type` / `Web Filtering` 标记；
+- 自动按 1s、2s、3s… 退避重试（默认 4 次，`--timeout` 只影响单次超时）；
+- 重试成功后继续，`sync` 结束时会汇总「期间站点网关拦截了 N 次请求，已自动重试成功」；
+- 连续被拦时降低并发（`--workers 4`），或稍等几十秒再来。
+
+### 常用命令对照
+
+命令名、选项、别名与 `nflsoj` **完全一致**，把 `nflsoj` 换成 `hydrooj` 即可：
+
+| 命令 | 说明 | Hydro 下的注意点 |
+|---|---|---|
+| `login` / `logout` / `whoami` / `config` | 登录与配置 | `config` 显示已保存的 Cookie 名称 |
+| `sync` | 同步比赛与题目 | 默认增量；`--full` 全量（69 页 / 约 1380 场） |
+| `contests` / `ls` | 比赛列表 | `--keyword` 是**客户端过滤**（站点 `?q=` 不生效） |
+| `problems` / `ps` | 题目列表 | 支持唯一 ID 前缀；未报名时题目会被隐藏 |
+| `mark` / `m` | 标记状态 | 省略状态 = 已完成；`--next` 循环 |
+| `stats` / `st` | 做题统计 | 纯本地，秒出 |
+| `open` / `o` | 浏览器打开 | 题目链接带 `?tid=` |
+| `export` | 导出记录 | `md` / `csv` / `json` |
+| `archive` / `arc` | Markdown 归档 | 见下 |
+
+### 归档
+
+```bash
+hydrooj archive 6a323c90                    # 单场
+hydrooj archive --all --limit 10            # 批量
+hydrooj archive --keyword 模拟赛             # 按名称
+hydrooj archive 6a323c90 --json             # 机器可读结果
+hydrooj archive 6a323c90 --dir D:\notes\oj   # 指定目录
+```
+
+目录结构与 `nflsoj` 一致，只是目录名里带 24 位 ID：
+
+```text
+~/.hydrooj/archive/
+├── index.md
+└── 6a323c90c9f0ca7cf29b5b0c-NOI2026模拟赛63/
+    ├── index.md                      # 比赛首页：赛制 / 时间 / 分组 / 题目表
+    └── problems/
+        ├── 01-Don't-Look-Back-in-Anger.md
+        ├── 02-献给空白的无败冠冕（T2）.md
+        └── 03-Median（T3）中位数.md
+```
+
+题面文件在通用字段之外还会带上 Hydro 特有的**时限**与**内存限制**（如
+`**时限**：1000 ms`、`**内存**：256 MB`），front matter 里的 `source` 是
+`/p/<pid>?tid=<cid>` 形式的原始链接。
+
+### 离线与数据目录
+
+与 `nflsoj` 相同：`--offline` 下 `contests` / `problems` / `stats` / `export` / `open`
+照常可用，而 `login` / `sync` / `archive` 等需要联网的命令会直接报错并提示去掉该参数。
+
+```bash
+hydrooj --offline contests                 # 只用本地缓存
+hydrooj --data-dir D:\ojdata login         # 临时指定数据目录
+$env:HYDROOJ_DATA_DIR = "D:\ojdata"        # PowerShell 设置默认数据目录
+```
+
+### 站点 API 说明（Hydro JSON 视图）
+
+所有页面加上 `Accept: application/json` 就返回原始数据，工具据此省掉了 HTML 解析：
+
+| 方法 | 路径 | 返回要点 |
+|---|---|---|
+| `GET` | `/` | `UserContext`（JSON 字符串：`_id` / `uname` / `priv`）、`domain`、`UiContext` |
+| `GET` | `/login` → `POST /login` | 表单 `uname` / `password` / `rememberme`，成功 200 + `Set-Cookie: sid`，失败 403 |
+| `GET` | `/contest?page=N` | `tdocs[]`（`title` / `rule` / `beginAt` / `endAt` / `pids` / `assign`）、`tpcount`（总页数） |
+| `GET` | `/contest/<cid>/problems` | `tdoc`、`pdict`（题目标题 / `config` 时限内存 / `tag`）、`tsdoc.endPsdict`（我的提交状态） |
+| `GET` | `/p/<pid>?tid=<cid>` | `pdoc.content` 为 `{"zh": "<Markdown>"}"`，另有 `pdoc.data`（测试数据文件列表） |
+
+未登录时这些接口会返回 `200` 且正文形如 `{"url": "/login?redirect=..."}`，工具会把它
+识别为「登录状态失效」而不是当成数据解析失败。
+
+---
+
 ## 项目结构
 
 ```text
 nflsoj-archive/
-├── pyproject.toml              # 项目元数据、依赖（空）、两个控制台入口
+├── pyproject.toml              # 项目元数据、依赖（空）、四个控制台入口
 ├── uv.lock                     # uv 的锁文件
 ├── .python-version             # 3.14
 ├── README.md                   # 本文档
+├── LICENSE                     # GPL-3.0
 ├── src/
-│   └── nflsoj_archive/
+│   ├── nflsoj_archive/         # 共享前端 + NFLSOJ 后端
+│   │   ├── __init__.py         # 导出 main / __version__
+│   │   ├── __main__.py         # python -m nflsoj_archive 入口
+│   │   └── nflsoj.py           # HTTP 传输、Console/Progress 渲染、Store、归档渲染、CLI
+│   └── hydrooj_archive/        # Hydro 后端（复用上面的前端）
 │       ├── __init__.py         # 导出 main / __version__
-│       ├── __main__.py         # python -m nflsoj_archive 入口
-│       └── nflsoj.py           # 全部实现：HTTP 传输、API 客户端、存储、渲染、CLI
+│       ├── __main__.py         # python -m hydrooj_archive 入口
+│       └── hydrooj.py          # Hydro JSON 客户端、数据规整、归档、CLI
 └── tests/
-    └── test_nflsoj.py          # 离线单元测试（不访问网络）
+    ├── test_nflsoj.py          # 离线单元测试（不访问网络）
+    └── test_hydrooj.py         # Hydro 版离线单元测试
 ```
 
-运行测试（纯离线，`unittest` 标准库即可）：
+运行测试（纯离线，`unittest` 标准库即可，共 160 个用例）：
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-代码组织（都在 `nflsoj.py` 内）：
+`nflsoj.py` 的代码组织：
 
 | 区块 | 内容 |
 |---|---|
 | 文本宽度与渲染 | `char_width` / `truncate` / `wrap_display`、`Console`（表格 / 进度条 / 徽标）、`Progress` |
 | 传输层 | `HttpTransport`（keep-alive、重试、重定向、gzip）、`Client`（五个 API） |
 | 数据规整 | `normalize_contest` / `extract_problems` / `extract_announcements` |
-| 存储 | `Store`（config / progress / 题面缓存 / 归档元数据） |
+| 存储 | `Store`（config / progress / 题面缓存 / 归档元数据）、`atomic_write_text` |
 | 业务 | `sync_contests`、`archive_contests`、`collect_stats`、`render_*_markdown` |
 | CLI | `build_parser`（argparse 定义）、`cmd_*` 各命令、`main` |
+
+`hydrooj.py` 的代码组织（**前端部分全部复用 `nflsoj_archive.nflsoj`**）：
+
+| 区块 | 内容 |
+|---|---|
+| 站点客户端 | `HydroClient`（JSON 视图、Cookie 会话、网关拦截重试、JSON 表单登录） |
+| 数据规整 | `_localized`（`{"zh": ...}` 拆包）、`contest_from_tdoc`、`extract_problems`、`problem_statement` |
+| 业务 | `fetch_contest_pages`、`sync_contests`、`archive_contests` / `archive_one_contest` |
+| 复用 | `Console` / `Progress` / `Store` / `render_*_markdown` / `print_contest_header` / 状态与统计逻辑 |
 
 ---
 

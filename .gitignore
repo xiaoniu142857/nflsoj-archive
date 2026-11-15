@@ -8,13 +8,16 @@ wheels/
 
 # Virtual environments
 .venv
+.venv-local/
 .uv-cache/
 .uv-tools/
 
 # 本地数据 / 临时目录（测试与调试产物）
 .testdata*/
 .test-tmp/
+.work/
 .probe/
 .probe_token
 .nflsoj/
+.hydrooj/
 *.log

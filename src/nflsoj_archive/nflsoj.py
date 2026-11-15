@@ -1860,10 +1860,11 @@ def contest_link(base_url: str, contest_id, display_order=None) -> str:
     return url
 
 
-def print_contest_header(console: Console, entry: dict, base_url: str = "") -> None:
+def print_contest_header(console: Console, entry: dict, base_url: str = "",
+                         link_builder=None, note: str = None) -> None:
     name = entry.get("name") or ("比赛 %s" % entry.get("id"))
     phase = contest_phase(entry.get("startTime"), entry.get("endTime"), entry.get("phase"))
-    console.title(name, note="#%s" % entry.get("id"))
+    console.title(name, note="#%s" % entry.get("id") if note is None else note)
     bits = [console.phase_pill(phase), console.paint(str(entry.get("mode") or "-"), "magenta")]
     bits.append(console.paint(fmt_interval(entry.get("startTime"), entry.get("endTime")), "grey"))
     if entry.get("creator"):
@@ -1872,7 +1873,9 @@ def print_contest_header(console: Console, entry: dict, base_url: str = "") -> N
         bits.append(console.paint("分组 " + ", ".join(entry["groups"]), "grey"))
     console.out("  " + console.paint(" · ", "grey").join(bits))
     if base_url:
-        console.out("  " + console.paint(contest_link(base_url, entry.get("id")), "blue", dim=True))
+        url = (link_builder(entry) if link_builder
+               else contest_link(base_url, entry.get("id")))
+        console.out("  " + console.paint(url, "blue", dim=True))
 
 
 # ---------------------------------------------------------------------------
@@ -1991,6 +1994,26 @@ def write_if_changed(path: str, content: str) -> str:
     return "written"
 
 
+_ARCHIVED_AT_RE = re.compile(r'^archived_at:\s*"([^"]+)"', re.MULTILINE)
+
+
+def preserved_timestamp(path: str, force: bool = False, default: str = None) -> str:
+    """返回归档时间戳：默认沿用文件里已有的 archived_at，保证重复归档不改写文件。
+
+    force=True（或文件不存在 / 读不到时间戳）时使用当前时间。
+    """
+    if not force:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                head = handle.read(4096)
+            match = _ARCHIVED_AT_RE.search(head)
+            if match:
+                return match.group(1)
+        except (OSError, UnicodeDecodeError):
+            pass
+    return default or fmt_local_iso(time.time())
+
+
 def contest_dir_name(contest: dict, used=None) -> str:
     base = "%s-%s" % (contest.get("id"), slugify(contest.get("name"), 44, "contest"))
     name = base
@@ -2019,6 +2042,8 @@ def render_contest_markdown(bundle: dict) -> str:
     """生成比赛首页 Markdown。
 
     bundle: contest / problems / detail / files（displayOrder -> 相对路径）/ archived_at
+    可选：link_builder(contest, display_order=None) 自定义站点链接格式，
+          generator 自定义页脚署名（默认 nflsoj）。
     """
     contest = bundle["contest"]
     problems = bundle.get("problems") or []
@@ -2027,10 +2052,18 @@ def render_contest_markdown(bundle: dict) -> str:
     has_statement = bundle.get("has_statement") or {}
     archived_at = bundle.get("archived_at") or fmt_local_iso(time.time())
     base_url = bundle.get("base_url") or ""
+    generator = bundle.get("generator") or ("nflsoj %s" % __version__)
+    link_builder = bundle.get("link_builder")
+
+    def site_link(target, order=None):
+        if link_builder:
+            return link_builder(target, order)
+        return contest_link(base_url, target.get("id") if isinstance(target, dict) else target, order)
+
     contest_id = contest.get("id")
     phase = contest_phase(contest.get("startTime"), contest.get("endTime"), contest.get("phase"))
     stats = collection_counts(problems)
-    source = contest_link(base_url, contest_id) if base_url else ""
+    source = bundle.get("source_url") or (site_link(contest) if base_url else "")
 
     pairs = [
         ("title", contest.get("name") or "比赛 %s" % contest_id),
@@ -2046,7 +2079,7 @@ def render_contest_markdown(bundle: dict) -> str:
         ("local_doing", stats[STATE_DOING]),
         ("archived_at", archived_at),
         ("source", source),
-        ("generator", "nflsoj %s" % __version__),
+        ("generator", generator),
     ]
     lines = [build_front_matter(pairs), "",
              "# %s" % (contest.get("name") or "比赛 %s" % contest_id), ""]
@@ -2125,17 +2158,20 @@ def render_contest_markdown(bundle: dict) -> str:
     if source:
         lines.append("- 原站比赛页：%s" % source)
         if problems:
-            lines.append("- 原站题目页：%s" % contest_link(base_url, contest_id, 1))
+            lines.append("- 原站题目页：%s" % site_link(contest, 1))
     lines.append("- 本地索引：[返回总目录](../index.md)")
     lines.append("")
     lines.append("---")
-    lines.append("*归档于 %s · nflsoj %s · 内容以原站为准*" % (archived_at, __version__))
+    lines.append("*归档于 %s · %s · 内容以原站为准*" % (archived_at, generator))
     lines.append("")
     return "\n".join(lines)
 
 
 def render_problem_markdown(bundle: dict) -> str:
-    """生成单题 Markdown（题面 + 元信息 + 本地标记）。"""
+    """生成单题 Markdown（题面 + 元信息 + 本地标记）。
+
+    可选 bundle 键：link_builder(contest, display_order=None)、generator。
+    """
     contest = bundle["contest"]
     problem = bundle["problem"]
     statement = normalize_markdown(bundle.get("statement") or "")
@@ -2143,9 +2179,16 @@ def render_problem_markdown(bundle: dict) -> str:
     error = bundle.get("error") or ""
     archived_at = bundle.get("archived_at") or fmt_local_iso(time.time())
     base_url = bundle.get("base_url") or ""
+    generator = bundle.get("generator") or ("nflsoj %s" % __version__)
+    link_builder = bundle.get("link_builder")
     state = problem.get("state") or STATE_TODO
-    source = (contest_link(base_url, contest.get("id"), problem.get("displayOrder"))
-              if base_url else "")
+    if bundle.get("source_url"):
+        source = bundle["source_url"]
+    elif link_builder:
+        source = link_builder(contest, problem.get("displayOrder")) if base_url else ""
+    else:
+        source = (contest_link(base_url, contest.get("id"), problem.get("displayOrder"))
+                  if base_url else "")
     pairs = [
         ("title", problem.get("title") or ""),
         ("problem_id", problem.get("problemId")),
@@ -2160,7 +2203,7 @@ def render_problem_markdown(bundle: dict) -> str:
         ("submitted_users", problem.get("numSubmittedUsers")),
         ("archived_at", archived_at),
         ("source", source),
-        ("generator", "nflsoj %s" % __version__),
+        ("generator", generator),
     ]
     lines = [build_front_matter(pairs), "",
              "# %s. %s" % (problem.get("displayOrder"), problem.get("title") or ""), ""]
@@ -2178,6 +2221,10 @@ def render_problem_markdown(bundle: dict) -> str:
             problem.get("numAcceptedUsers", "-"), problem.get("numSubmittedUsers", "-")))
     if problem.get("scoreWeight") not in (None, ""):
         extras.append("**分值**：%s" % problem.get("scoreWeight"))
+    if problem.get("timeLimit") not in (None, ""):
+        extras.append("**时限**：%s" % problem.get("timeLimit"))
+    if problem.get("memoryLimit") not in (None, ""):
+        extras.append("**内存**：%s" % problem.get("memoryLimit"))
     if problem.get("bestStatus"):
         extras.append("**你的最好提交**：%s" % problem["bestStatus"])
     if extras:
@@ -2194,31 +2241,33 @@ def render_problem_markdown(bundle: dict) -> str:
     lines.append("---")
     if source:
         lines.append("原始链接：%s  " % source)
-    lines.append("归档于 %s · nflsoj %s" % (archived_at, __version__))
+    lines.append("归档于 %s · %s" % (archived_at, generator))
     lines.append("")
     return "\n".join(lines)
 
 
-def render_root_index(records, username: str = "") -> str:
+def render_root_index(records, username: str = "", title: str = "NFLSOJ 本地存档",
+                      generator: str = None, tool: str = "nflsoj") -> str:
     """生成存档根目录的 index.md。"""
     now = fmt_local_iso(time.time())
+    generator = generator or ("nflsoj %s" % __version__)
     total_problems = sum(item.get("problems", 0) for item in records)
     total_statements = sum(item.get("statements", 0) for item in records)
     lines = [build_front_matter([
-        ("title", "NFLSOJ 本地存档"),
+        ("title", title),
         ("user", username or ""),
         ("contests", len(records)),
         ("problems", total_problems),
         ("statements", total_statements),
         ("updated_at", now),
-        ("generator", "nflsoj %s" % __version__),
+        ("generator", generator),
     ]), "",
-        "# NFLSOJ 本地存档", "",
+        "# %s" % title, "",
         "> 账号 %s · 更新于 %s" % (username or "-", now), "",
         "共 **%d** 场比赛、**%d** 道题目，其中 **%d** 份题面已保存。" % (
             len(records), total_problems, total_statements), ""]
     if not records:
-        lines.extend(["*还没有任何存档。运行 `nflsoj archive --all` 开始归档。*", ""])
+        lines.extend(["*还没有任何存档。运行 `%s archive --all` 开始归档。*" % tool, ""])
         return "\n".join(lines)
     lines.append("| 比赛 | ID | 模式 | 时间 | 题目 | 已完成 | 题面 |")
     lines.append("|---|---:|---|---|---:|---:|---:|")
@@ -2232,7 +2281,7 @@ def render_root_index(records, username: str = "") -> str:
             item.get("problems", 0), item.get("done", 0), item.get("statements", 0)))
     lines.append("")
     lines.append("---")
-    lines.append("*由 nflsoj %s 生成，内容以原站为准。*" % __version__)
+    lines.append("*由 %s 生成，内容以原站为准。*" % generator)
     lines.append("")
     return "\n".join(lines)
 
@@ -2279,7 +2328,7 @@ def archive_one_contest(store: Store, username: str, console: Console, client: C
     dir_name = contest_dir_name(entry, used_dirs)
     contest_dir = os.path.join(root, dir_name)
     problems_dir = os.path.join(contest_dir, "problems")
-    archived_at = fmt_local_iso(time.time())
+    archived_at = preserved_timestamp(os.path.join(contest_dir, "index.md"), force)
 
     statements = {}
     errors = {}
@@ -2324,15 +2373,16 @@ def archive_one_contest(store: Store, username: str, console: Console, client: C
         pid = problem.get("problemId")
         payload = statements.get(str(pid)) or {}
         has_statement[str(problem.get("displayOrder"))] = bool(payload.get("statement"))
+        path = os.path.join(problems_dir, filename)
         content = render_problem_markdown({
             "contest": entry,
             "problem": problem,
             "statement": payload.get("statement"),
             "error": errors.get(str(pid), ""),
-            "archived_at": archived_at,
+            # 沿用已有文件的归档时间，重复归档时内容不变、不重写
+            "archived_at": preserved_timestamp(path, force, archived_at),
             "base_url": store.api_base,
         })
-        path = os.path.join(problems_dir, filename)
         if not with_statements and os.path.isfile(path):
             # 本次不抓题面：保留已有文件，别把之前存好的题面覆盖成占位文字
             try:

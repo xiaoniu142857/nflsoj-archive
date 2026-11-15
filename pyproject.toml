@@ -1,7 +1,7 @@
 [project]
 name = "nflsoj-archive"
-version = "1.1.0"
-description = "NFLSOJ 命令行工具：同步比赛与题目、标记做题进度、把比赛与题面归档成本地 Markdown"
+version = "1.2.0"
+description = "OJ 命令行工具集：同步比赛与题目、标记做题进度、把比赛与题面归档成本地 Markdown（支持 NFLSOJ 与 Hydro）"
 readme = "README.md"
 authors = [
     { name = "xiaoniu142857", email = "xiaoniu142857@163.com" }
@@ -12,7 +12,12 @@ dependencies = []
 [project.scripts]
 nflsoj = "nflsoj_archive:main"
 nflsoj-archive = "nflsoj_archive:main"
+hydrooj = "hydrooj_archive:main"
+hydrooj-archive = "hydrooj_archive:main"
 
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["nflsoj_archive", "hydrooj_archive"]
