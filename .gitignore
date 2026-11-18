@@ -15,9 +15,11 @@ wheels/
 # 本地数据 / 临时目录（测试与调试产物）
 .testdata*/
 .test-tmp/
+.audit/
 .work/
 .probe/
 .probe_token
 .nflsoj/
 .hydrooj/
 *.log
+*.corrupt-*

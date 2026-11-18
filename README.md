@@ -876,6 +876,46 @@ nflsoj --offline export -o 记录.md
 
 ## 从 1.0 升级
 
+### 1.2.0 稳定性加固（同一版本内的修补）
+
+在 1.2.0 上做了一轮全面体检（异常/边界输入、错误处理、启动退出、资源释放、日志诊断、
+兼容性），修掉了 30 余个问题。**这些都是修复，不改变正常用法**；只有下面几处行为更严格/更友好：
+
+| 场景 | 之前 | 现在 |
+|---|---|---|
+| `--timeout 0` / 负数 | socket 抛 `ValueError`，打整段 traceback | 用法错误：`--timeout 不能小于 1`，退出码 2 |
+| `--timeout` 超大 | 直接传给 socket | 钳到 3600 秒 |
+| `--width 0` / 负数 | 被当成"未指定"，或钳成 40 | 明确表示「跟随终端」 |
+| `--limit` 负数 | 静默切掉列表末尾几行 | 用法错误；`--limit 0` 表示「全部」 |
+| `--limit` 超大 | — | 正常接受（不限制） |
+| `--workers` 超大 | 真的开上千线程 | 钳到 16 并在标题下方标注「999 → 16（已钳位）」 |
+| `--state doen`（拼错） | 静默显示空表格 | 明确报「无法识别的状态」并列出可用值 |
+| `config.json` / `progress.json` 损坏 | 静默当成空数据，**下次写入会把原数据冲掉** | 先备份为 `*.corrupt-<时间戳>` 并告警，再以空数据继续（原文件可恢复） |
+| `progress.json` 结构异常（`users` 不是对象等） | `AttributeError` traceback | 逐层校验并降级为可用结构，只提示一次 |
+| 比赛/题目时间是对象、数组或乱码 | `TypeError: unhashable type` 崩溃 | 显示 `-`，阶段显示「时间未知」 |
+| `--dir` 指向已存在的文件 | `FileExistsError` traceback | 提示「用 --dir 指定一个目录」，退出码 1 |
+| `--api` 写成非法 URL | `ValueError` traceback | 提示地址无效，退出码 1 |
+| 站点拒绝连接 / DNS 失败 | 每个请求重试到超时（`archive` 要等几分钟） | 立即失败并提示检查 `--api` |
+| 站点 3xx 跳转 | 跳转消耗重试预算，`retries=0` 时直接返回空响应 | 跳转单独计数（最多 5 跳），跨站跳转直接拒绝并说明原因 |
+| 响应 gzip 损坏 | 压缩字节被当正文，报「非 JSON」 | 明确报「gzip 解码失败，可能被代理改写」 |
+| 输出重定向到非 UTF-8 文件 | `UnicodeEncodeError` traceback | 自动降级为可打印字符 |
+| 下游管道提前关闭（`\| head`） | 退出码 120 + `Exception ignored` | 静默退出，退出码 0 |
+| Ctrl+C | 可能卡在等待线程池 | 立即取消并退出，退出码 130；已完成的进度先落盘 |
+| 工具自身未预期的异常 | 整段 traceback | 一行中文提示；`--debug` 或设置 `NFLSOJ_TRACEBACK=1` 才显示堆栈 |
+| 归档路径超过 Windows 260 字符 | 含糊的「无法写入文件」 | 明确提示路径过长并给出三种解法 |
+| 归档文件被编辑器占用 | 直接失败 | 自动重试 3 次，仍失败时提示「关闭占用的程序」 |
+| `--limit 0` 的列表命令 | 显示 0 行 | 显示全部（`--limit 0` = 不限制） |
+
+另外顺手做的改进：
+
+- **性能**：`contests --live` / `sync --no-problems` 的列表阶段改为并发翻页（11 页从 ~5.7s 降到 ~1s）；
+  归档复用同一个线程池且线程退出时回收 keep-alive 连接，长时间 `archive --all` 不再堆积 socket。
+- **诊断**：`--debug` 现在会打印站点地址/超时/重试配置、每次请求的耗时、重试与跳转次数，
+  并在命令结束时汇总「N 次请求 / R 次重试 / D 次跳转」；凭据一律掩码，不会出现在日志里。
+- **交互**：`sync` 显示实际生效的并发数；`problems --state` 过滤为空时说明是"过滤掉了"而不是"没有题目"；
+  脏数据文件的告警只出现一次，并附带备份路径与恢复方法。
+- **测试**：从 160 个增加到 225 个（新增 65 个健壮性用例，含本机回环 HTTP 服务模拟跳转/gzip/429）。
+
 ### 1.1 → 1.2
 
 1.2.0 是**纯增量**版本，`nflsoj` 的命令与行为不变（旧数据、旧脚本可继续用）：
@@ -886,7 +926,7 @@ nflsoj --offline export -o 记录.md
 | 控制台命令 | `nflsoj` / `nflsoj-archive` | 增加 `hydrooj` / `hydrooj-archive` |
 | 共享层 | `nflsoj.py` 自带全部逻辑 | `render_*` / `print_contest_header` 增加 `link_builder` / `generator` / `source_url` 可选参数，供 Hydro 复用 |
 | 归档时间戳 | 每次归档刷新 `archived_at`，导致重复归档总是重写文件 | **沿用已有文件的 `archived_at`**，重复归档真正 0 写入；`--force` 才刷新 |
-| 测试 | 96 个 | 160 个（新增 64 个 Hydro 用例） |
+| 测试 | 96 个 | 160 个（新增 64 个 Hydro 用例）→ 后续加固补齐至 225 个 |
 
 ### 1.0 → 1.1
 
@@ -1174,6 +1214,47 @@ C:\Users\<你>\.local\bin\python.exe src\nflsoj_archive\nflsoj.py login
 > 复制进工作区再运行，如果它变成 Low，说明是目录带着 Low 标签，从里面启动的任何
 > 程序都会被降级——这时用 A/B 修目录，或直接用 C。
 
+**Q13：提示「本地数据文件损坏，已备份：…」怎么办？**
+
+说明 `config.json` / `progress.json` 不是合法 JSON（编辑器写坏、磁盘写一半、手工改错）。
+工具**不会覆盖原文件**，而是把它改名成 `<原名>.corrupt-<时间戳>`，再以空数据继续。
+
+恢复步骤：
+
+```powershell
+# 1. 用编辑器打开备份，按提示的原因修好坏掉的部分（常见是少括号、多逗号）
+notepad "$env:USERPROFILE\.nflsoj\progress.json.corrupt-20261118-213701"
+# 2. 修好后改回原名（先删掉/挪走当前的 progress.json）
+Move-Item "$env:USERPROFILE\.nflsoj\progress.json" progress.empty.json
+Move-Item "$env:USERPROFILE\.nflsoj\progress.json.corrupt-20261118-213701" progress.json
+# 3. 验证
+nflsoj stats
+```
+
+如果只是结构字段类型不对（比如 `users` 被写成了数组），工具会自动降级并提示，
+不需要人工修；只有"整个文件不是合法 JSON"才需要按上面步骤恢复。
+
+**Q14：`archive` 报「路径过长」？**
+
+Windows 默认限制单条路径 260 字符，而归档路径 = 归档目录 + `<ID>-<比赛名>` +
+`problems` + `<序号>-<题目名>.md`。三种解法：
+
+```powershell
+# A. 换一个更短的归档目录（推荐）
+nflsoj archive --all --dir D:\oj
+# B. 缩短比赛/题目名（工具已把文件名截到 44 字符，通常够用）
+# C. 启用 Windows 长路径支持（管理员，修改注册表后重启）
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+  -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force
+```
+
+**Q15：`--debug` 会泄露 token / 密码吗？**
+
+不会。`--debug` 只打印请求方法、URL、状态码、字节数、耗时、重试与跳转次数；
+令牌、Cookie、请求体一律不打印，URL 里若带凭据也会被掩码成 `***`。
+需要完整堆栈排查时用 `NFLSOJ_TRACEBACK=1`（hydrooj 用 `HYDROOJ_TRACEBACK=1`），
+它只影响异常打印，同样不会输出凭据。
+
 ---
 
 ## Hydro 版：hydrooj
@@ -1332,7 +1413,7 @@ nflsoj-archive/
     └── test_hydrooj.py         # Hydro 版离线单元测试
 ```
 
-运行测试（纯离线，`unittest` 标准库即可，共 160 个用例）：
+运行测试（纯离线，`unittest` 标准库即可，共 225 个用例）：
 
 ```bash
 python -m unittest discover -s tests -v

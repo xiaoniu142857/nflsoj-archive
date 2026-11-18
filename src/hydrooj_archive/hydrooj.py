@@ -71,6 +71,14 @@ STATE_LABEL = core.STATE_LABEL
 STATE_ORDER = core.STATE_ORDER
 STATE_ALIASES = core.STATE_ALIASES
 DEFAULT_MARK_STATE = core.DEFAULT_MARK_STATE
+arg_int_range = core.arg_int_range
+arg_int_min = core.arg_int_min
+clamp_timeout = core.clamp_timeout
+clamp_workers = core.clamp_workers
+safe_int = core.safe_int
+TIMEOUT_MIN, TIMEOUT_MAX = core.TIMEOUT_MIN, core.TIMEOUT_MAX
+WORKERS_MIN, WORKERS_MAX = core.WORKERS_MIN, core.WORKERS_MAX
+WIDTH_MIN, WIDTH_MAX = core.WIDTH_MIN, core.WIDTH_MAX
 
 # Hydro 的赛制代号 → 展示用名称
 RULE_LABELS = {
@@ -181,7 +189,17 @@ class HydroClient:
         try:
             response = urllib.request.urlopen(request, timeout=self.timeout)
         except urllib.error.HTTPError as exc:
-            status, headers_out, payload = exc.code, exc.headers, exc.read()
+            with exc:                      # HTTPError 也是响应对象，确定性地释放连接
+                status = exc.code
+                headers_out = exc.headers
+                try:
+                    payload = exc.read()
+                except OSError:
+                    payload = b""
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            reason = getattr(exc, "reason", exc) or exc
+            raise ApiError("网络错误：%s" % reason, None,
+                           core.network_error_hint(reason, DEFAULT_API))
         else:
             with response:
                 status, headers_out, payload = response.status, response.headers, response.read()
@@ -252,12 +270,19 @@ class HydroClient:
                                "检查比赛 / 题目 ID 是否正确")
             raise ApiError("服务器返回了非 JSON 内容（可能被网关拦截）", status,
                            "稍后重试；若持续失败，请先在浏览器打开站点确认状态")
-        if isinstance(data, dict) and data.get("error"):
-            message = (data.get("error") or {}).get("message") or "未知错误"
+        if not isinstance(data, dict):
+            raise ApiError("服务器返回了非预期的数据结构（期望 JSON 对象）", status,
+                           "站点版本可能不兼容，请确认是否为 Hydro v4")
+        error = data.get("error")
+        if error:
+            if isinstance(error, dict):
+                message = error.get("message") or "未知错误"
+            else:
+                message = str(error)
             raise ApiError("站点返回错误：%s" % message, status,
                            "检查 ID 是否正确，或确认是否有查看权限")
         # 未登录时 Hydro 会返回 {"url": "/login?...", "UiContext": ..., "UserContext": ...}
-        if (isinstance(data, dict) and data.get("url")
+        if (data.get("url")
                 and "tdoc" not in data and "pdoc" not in data and "tdocs" not in data):
             raise ApiError("登录状态无效或已过期", 401, "请重新执行：hydrooj login")
         return data
@@ -281,7 +306,8 @@ class HydroClient:
 
     def domain_info(self) -> dict:
         try:
-            return self.get_json("/").get("domain") or {}
+            domain = self.get_json("/").get("domain")
+            return domain if isinstance(domain, dict) else {}
         except ApiError:
             return {}
 
@@ -314,6 +340,7 @@ class HydroClient:
         post_headers = dict(headers)
         post_headers["Content-Type"] = "application/x-www-form-urlencoded"
         status, text = 0, ""
+        pw_error = False
         for attempt in range(self.retries + 1):
             try:
                 with opener.open(urllib.request.Request(
@@ -322,13 +349,29 @@ class HydroClient:
                     status = response.status
                     text = response.read().decode("utf-8", "replace")
             except urllib.error.HTTPError as exc:
-                status = exc.code
-                text = exc.read().decode("utf-8", "replace")
+                with exc:
+                    status = exc.code
+                    try:
+                        text = exc.read().decode("utf-8", "replace")
+                    except OSError:
+                        text = ""
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                reason = getattr(exc, "reason", exc) or exc
+                fatal = core.is_fatal_network_error(reason)
+                if not fatal and attempt < self.retries:
+                    self.blocked += 1
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise ApiError("网络错误：%s" % reason, None,
+                           core.network_error_hint(reason, DEFAULT_API))
             blocked = any(marker in text[:4096] for marker in BLOCK_MARKERS)
             pw_error = "密码错误" in text or "用户名不存在" in text
             if (blocked or status == 503 or status >= 500
                     or (status == 403 and not pw_error)) and attempt < self.retries:
                 self.blocked += 1
+                if self.debug:
+                    sys.stderr.write("[debug] 登录被拦/5xx（%s），重试 %d/%d\n"
+                                     % (status, attempt + 1, self.retries))
                 time.sleep(1.0 * (attempt + 1))
                 continue
             break
@@ -548,6 +591,26 @@ def _safe_save_progress(store: Store, console: Console) -> None:
         console.warn("未能写入本地缓存：%s" % exc.message)
 
 
+MAX_CONTEST_PAGES = 500          # 与 nflsoj 一致的上限，防止异常 tpcount 导致死循环
+
+
+def _page_batch(data) -> list:
+    """把一页数据规整成比赛列表；tdocs 不是列表时按空页处理。"""
+    if not isinstance(data, dict):
+        return []
+    tsdict = data.get("tsdict")
+    tsdict = tsdict if isinstance(tsdict, dict) else {}
+    tdocs = data.get("tdocs")
+    if not isinstance(tdocs, list):
+        return []
+    batch = []
+    for tdoc in tdocs:
+        if not isinstance(tdoc, dict):
+            continue
+        batch.append(contest_from_tdoc(tdoc, tsdict.get(str(tdoc.get("_id")))))
+    return batch
+
+
 def fetch_contest_pages(client: HydroClient, console: Console, max_pages=None,
                         workers: int = DEFAULT_WORKERS, on_page=None):
     """逐页拉取比赛列表，返回 (contests, total_pages)。
@@ -555,41 +618,40 @@ def fetch_contest_pages(client: HydroClient, console: Console, max_pages=None,
     on_page(batch, page_no) 返回 True 时提前结束（增量同步用）。
     第 1、2 页串行（便于增量判断），其余页按批并发抓取。
     """
-    first = client.contest_page(1)
-    total = int(first.get("tpcount") or 1)
-    if max_pages:
-        total = min(total, max(1, int(max_pages)))
+    progress = Progress(console, "获取比赛列表", unit="页", detail_width=24).start_line()
     batches = {}
-
-    def take(page_no, data):
-        tsdict = (data or {}).get("tsdict") or {}
-        batch = [contest_from_tdoc(tdoc, tsdict.get(str(tdoc.get("_id"))))
-                 for tdoc in ((data or {}).get("tdocs") or [])]
-        batches[page_no] = batch
-        return batch
-
-    progress = Progress(console, "获取比赛列表", total=total, unit="页",
-                        detail_width=24).start_line()
-    progress.update(1)
     stopped = False
-    take(1, first)
-    if on_page and on_page(batches[1], 1):
-        stopped = True
+    total = 1
     try:
+        first = client.contest_page(1)
+        raw_total = first.get("tpcount") if isinstance(first, dict) else None
+        total = max(1, min(safe_int(raw_total, 1), MAX_CONTEST_PAGES))
+        progress.total = total
+        if max_pages:
+            total = min(total, max(1, safe_int(max_pages, 1)))
+        batches[1] = _page_batch(first)
+        progress.update(1, detail="第 1 页")
+        if on_page and on_page(batches[1], 1):
+            stopped = True
         if not stopped and total >= 2:
-            take(2, client.contest_page(2))
+            batches[2] = _page_batch(client.contest_page(2))
             progress.update(1, detail="第 2 页")
             if on_page and on_page(batches[2], 2):
                 stopped = True
         page = 3
+        batch_size = clamp_workers(workers)
         while not stopped and page <= total:
-            group = list(range(page, min(page + max(1, workers), total + 1)))
-            with ThreadPoolExecutor(max_workers=len(group)) as pool:
+            group = list(range(page, min(page + batch_size, total + 1)))
+            pool = ThreadPoolExecutor(max_workers=len(group))
+            try:
                 results = list(pool.map(client.contest_page, group))
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+                release_connections(client)
             for page_no, data in zip(group, results):
-                batch = take(page_no, data)
+                batches[page_no] = _page_batch(data)
                 progress.update(1, detail="第 %d 页" % page_no)
-                if on_page and on_page(batch, page_no):
+                if on_page and on_page(batches[page_no], page_no):
                     stopped = True
                     break
             page = group[-1] + 1
@@ -1198,15 +1260,21 @@ def cmd_sync(args, store: Store, console: Console) -> int:
         console.kv("关键词", args.keyword)
     if args.contest:
         console.kv("指定比赛", ", ".join(short_id(c) for c in args.contest))
-    console.kv("并发数", str(args.workers))
+    effective_workers = clamp_workers(args.workers)
+    if effective_workers != args.workers:
+        console.kv("并发数", "%d \u2192 %d\uff08\u8d85\u51fa\u5408\u7406\u8303\u56f4\uff0c\u5df2\u94b3\u4f4d\uff09"
+                   % (args.workers, effective_workers), value_color="yellow")
+    else:
+        console.kv("并发数", str(effective_workers))
     incremental = bool(args.incremental) and not args.force and not args.contest and not args.keyword
     console.kv("同步模式", "增量（连续两页已同步即停止）" if incremental else "全量")
     console.blank()
     try:
         stats = sync_contests(store, username, console, client,
                               keyword=args.keyword, only_ids=args.contest,
-                              workers=args.workers, with_problems=not args.no_problems,
-                              force=args.force, incremental=incremental, limit=args.limit)
+                              workers=effective_workers, with_problems=not args.no_problems,
+                              force=args.force, incremental=incremental,
+                              limit=(args.limit or None))
     except ApiError as exc:
         return core.report_error(console, exc)
     finally:
@@ -1259,11 +1327,11 @@ def cmd_contests(args, store: Store, console: Console) -> int:
             if not filters_active:
                 return False
             filtered = _apply_filters(collected, args.keyword, args.phase, args.ids)
-            return len(filtered) >= args.limit
+            return bool(args.limit) and len(filtered) >= args.limit
 
         max_pages = None
         if not filters_active:
-            max_pages = max(1, (args.limit + PAGE_SIZE - 1) // PAGE_SIZE)
+            max_pages = max(1, (core.safe_int(args.limit, 1) + PAGE_SIZE - 1) // PAGE_SIZE)
         try:
             fetched, _total = fetch_contest_pages(client, console, max_pages=max_pages,
                                                   workers=args.workers, on_page=on_page)
@@ -1296,7 +1364,7 @@ def cmd_contests(args, store: Store, console: Console) -> int:
     total_done = total_problems = 0
     phase_count = {"not_started": 0, "running": 0, "ended": 0}
     narrow = console.width < 96
-    for contest in contests[: args.limit]:
+    for contest in core.limit_take(contests, args.limit):
         phase = core.contest_phase(contest.get("startTime"), contest.get("endTime"),
                                    contest.get("phase"))
         phase_count[phase] = phase_count.get(phase, 0) + 1
@@ -1334,7 +1402,7 @@ def cmd_contests(args, store: Store, console: Console) -> int:
     else:
         console.table(["状态", "短 ID", "比赛名称", "规则", "开始", "结束", "已完成"],
                       rows, aligns=["center", "right", "left", "center", "left", "left", "left"])
-    if len(contests) > args.limit:
+    if core.limit_applies(contests, args.limit):
         console.muted("仅显示前 %d 场，可用 --limit 调整（当前共 %d 场）" % (args.limit, len(contests)))
     console.blank()
     console.out("  %s 未开始 %d · 进行中 %d · 已结束 %d" % (
@@ -1622,7 +1690,7 @@ def cmd_stats(args, store: Store, console: Console) -> int:
     rows = []
     ranked = sorted(stats["per_contest"], key=lambda r: r["total"], reverse=True)
     narrow = console.width < 104
-    for row in ranked[: args.limit]:
+    for row in core.limit_take(ranked, args.limit):
         contest = row["contest"]
         phase = core.contest_phase(contest.get("startTime"), contest.get("endTime"),
                                    contest.get("phase"))
@@ -1656,7 +1724,7 @@ def cmd_stats(args, store: Store, console: Console) -> int:
             console.table(["状态", "短 ID", "比赛名称", "题目", "已完成", "正在做", "未完成", "进度"],
                           rows, aligns=["center", "right", "left", "right", "right",
                                         "right", "right", "left"])
-        if len(ranked) > args.limit:
+        if core.limit_applies(ranked, args.limit):
             console.muted("仅显示前 %d 场，可用 --limit 调整（当前共 %d 场）"
                           % (args.limit, len(ranked)))
 
@@ -2051,8 +2119,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="数据目录（默认环境变量 %s，否则 %s）" % (DATA_DIR_ENV, DEFAULT_DATA_DIR))
     common.add_argument("--api", default=argparse.SUPPRESS, metavar="URL",
                         help="站点地址（默认 %s）" % DEFAULT_API)
-    common.add_argument("--timeout", type=int, default=argparse.SUPPRESS, metavar="N",
-                        help="HTTP 超时秒数（默认 30）")
+    common.add_argument("--timeout", type=arg_int_min(1),
+                        default=argparse.SUPPRESS, metavar="N",
+                        help="HTTP 超时秒数（≥1，超出 %d 会钳位；默认 30）" % TIMEOUT_MAX)
     common.add_argument("--insecure", action="store_true", default=argparse.SUPPRESS,
                         help="跳过 HTTPS 证书校验")
     common.add_argument("--debug", action="store_true", default=argparse.SUPPRESS,
@@ -2067,8 +2136,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="使用纯 ASCII 字符（兼容老终端）")
     common.add_argument("--no-progress", action="store_true", default=argparse.SUPPRESS,
                         help="不显示实时进度条")
-    common.add_argument("--width", type=int, default=argparse.SUPPRESS, metavar="N",
-                        help="输出宽度（默认跟随终端）")
+    common.add_argument("--width", type=arg_int_min(0), default=argparse.SUPPRESS,
+                        metavar="N",
+                        help="输出宽度（0 = 跟随终端，其余钳到 %d-%d）"
+                        % (WIDTH_MIN, WIDTH_MAX))
 
     parser = argparse.ArgumentParser(
         prog="hydrooj",
@@ -2106,9 +2177,12 @@ def build_parser() -> argparse.ArgumentParser:
                                    "并跳过已有题目缓存的比赛。")
     p.add_argument("--keyword", help="只同步名称包含该关键词的比赛")
     p.add_argument("--contest", nargs="*", metavar="ID", help="只同步指定 ID 的比赛")
-    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS, metavar="N",
-                   help="并发线程数（默认 %d，建议 4-8，站点有网关拦截）" % DEFAULT_WORKERS)
-    p.add_argument("--limit", type=int, metavar="N", help="最多同步多少场比赛")
+    p.add_argument("--workers", type=arg_int_min(1),
+                   default=DEFAULT_WORKERS, metavar="N",
+                   help="并发线程数（默认 %d，实际钳到 %d-%d）"
+                   % (DEFAULT_WORKERS, WORKERS_MIN, WORKERS_MAX))
+    p.add_argument("--limit", type=arg_int_min(0), metavar="N",
+                   help="最多同步多少场比赛（0 = 不限制）")
     p.add_argument("--no-problems", action="store_true", help="只同步比赛列表，不拉题目")
     p.add_argument("--force", action="store_true", help="强制重新拉取已有比赛的题目")
     p.add_argument("--full", dest="incremental", action="store_false",
@@ -2119,10 +2193,12 @@ def build_parser() -> argparse.ArgumentParser:
                        description="列出比赛（默认读本地缓存，--live 从服务器刷新）。")
     p.add_argument("--live", action="store_true", help="直接请求服务器（并写回缓存）")
     p.add_argument("--keyword", help="按名称过滤")
-    p.add_argument("--phase", choices=["not_started", "running", "ended"], help="按状态过滤")
+    p.add_argument("--phase", choices=["not_started", "running", "ended", "unknown"], help="按状态过滤")
     p.add_argument("--ids", nargs="*", metavar="ID", help="只显示指定 ID（支持唯一前缀）")
-    p.add_argument("--limit", type=int, default=50, metavar="N", help="最多显示多少场（默认 50）")
-    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS, metavar="N",
+    p.add_argument("--limit", type=arg_int_min(0), default=50, metavar="N",
+                   help="最多显示多少场（默认 50；0 = 全部）")
+    p.add_argument("--workers", type=arg_int_min(1),
+                   default=DEFAULT_WORKERS, metavar="N",
                    help="--live 时的并发线程数（默认 %d）" % DEFAULT_WORKERS)
     p.set_defaults(handler=cmd_contests)
 
@@ -2152,9 +2228,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("stats", parents=[common], aliases=["st"], help="做题情况统计（本地）")
     p.add_argument("--contest", nargs="*", metavar="SPEC", help="只统计指定比赛（ID 或名称）")
     p.add_argument("--keyword", help="按比赛名称过滤")
-    p.add_argument("--phase", choices=["not_started", "running", "ended"], help="按状态过滤")
-    p.add_argument("--limit", type=int, default=20, metavar="N", help="表格最多显示行数（默认 20）")
-    p.add_argument("--recent", type=int, default=8, metavar="N", help="最近标记条数（默认 8）")
+    p.add_argument("--phase", choices=["not_started", "running", "ended", "unknown"], help="按状态过滤")
+    p.add_argument("--limit", type=arg_int_min(0), default=20, metavar="N",
+                   help="表格最多显示行数（默认 20；0 = 全部）")
+    p.add_argument("--recent", type=arg_int_min(0), default=8, metavar="N",
+                   help="最近标记条数（默认 8；0 = 不显示）")
     p.add_argument("--no-recent", action="store_true", help="不显示最近标记")
     p.add_argument("--json", action="store_true", help="以 JSON 输出")
     p.set_defaults(handler=cmd_stats)
@@ -2171,7 +2249,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", metavar="FILE", help="输出文件（默认打印到屏幕；- 代表屏幕）")
     p.add_argument("--contest", nargs="*", metavar="SPEC", help="只导出指定比赛")
     p.add_argument("--keyword", help="按比赛名称过滤")
-    p.add_argument("--phase", choices=["not_started", "running", "ended"], help="按状态过滤")
+    p.add_argument("--phase", choices=["not_started", "running", "ended", "unknown"], help="按状态过滤")
     p.set_defaults(handler=cmd_export)
 
     p = sub.add_parser("archive", parents=[common], aliases=["arc"],
@@ -2181,12 +2259,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("contest", nargs="*", metavar="SPEC", help="比赛 ID（或唯一前缀 / 名称关键词）")
     p.add_argument("--all", action="store_true", help="归档本地全部已同步的比赛")
     p.add_argument("--keyword", help="按比赛名称过滤（可单独使用）")
-    p.add_argument("--phase", choices=["not_started", "running", "ended"], help="按状态过滤")
-    p.add_argument("--limit", type=int, metavar="N", help="最多归档多少场比赛")
+    p.add_argument("--phase", choices=["not_started", "running", "ended", "unknown"], help="按状态过滤")
+    p.add_argument("--limit", type=arg_int_min(0), metavar="N",
+                   help="最多归档多少场比赛（0 = 不限制）")
     p.add_argument("--dir", metavar="DIR", help="归档目录（默认 %s）" % "<数据目录>/archive")
     p.add_argument("--no-statements", action="store_true", help="只存比赛首页，不抓题目正文")
     p.add_argument("--force", action="store_true", help="忽略本地题面缓存，强制重新抓取")
-    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS, metavar="N",
+    p.add_argument("--workers", type=arg_int_min(1),
+                   default=DEFAULT_WORKERS, metavar="N",
                    help="并发抓取题面的线程数（默认 %d）" % DEFAULT_WORKERS)
     p.add_argument("--open", action="store_true", help="归档完成后打开总目录")
     p.add_argument("--json", action="store_true", help="以 JSON 输出归档结果")
@@ -2196,80 +2276,93 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
     ansi_ok = core.enable_windows_ansi()
-    ascii_only = bool(getattr(args, "ascii", False))
-    if not ascii_only:
-        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-        try:
-            "─│┌✔○◐→█░…".encode(encoding)
-        except Exception:
-            ascii_only = True
-
-    color = not bool(getattr(args, "no_color", False))
-    if os.environ.get("NO_COLOR"):
-        color = False
+    core.prepare_streams()
+    console = None
     try:
-        if not sys.stdout.isatty():
+        parser = build_parser()
+        args = parser.parse_args(argv)
+
+        ascii_only = bool(getattr(args, "ascii", False))
+        if not ascii_only:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            try:
+                "─│┌✔○◐→█░…".encode(encoding)
+            except (LookupError, UnicodeEncodeError):
+                ascii_only = True
+
+        color = not bool(getattr(args, "no_color", False))
+        if "NO_COLOR" in os.environ:          # 该变量「存在即生效」（含空值）
             color = False
-    except Exception:
-        color = False
-    if os.name == "nt" and color and not ansi_ok:
-        color = False
-
-    if os.name == "nt":
+        if os.environ.get("TERM", "").strip().lower() == "dumb":
+            color = False
         try:
-            if sys.stdout.isatty():
-                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            if not sys.stdout.isatty():
+                color = False
         except Exception:
-            pass
+            color = False
+        if os.name == "nt" and color and not ansi_ok:
+            color = False
 
-    console = Console(color=color, ascii_only=ascii_only,
-                      width=getattr(args, "width", None),
-                      progress=not getattr(args, "no_progress", False))
-    data_dir = resolve_data_dir(getattr(args, "data_dir", None))
-    store = Store(data_dir)
-    store.load()
-    # --api 只覆盖本次运行的地址（login / config 才会写入配置）
-    store.api_override = (getattr(args, "api", None) or "").rstrip("/")
-    # Store 是通用实现，默认站点地址属于 nflsoj；本工具在没有配置地址时用自己的默认值
-    if not store.api_override and not store.config.get("baseUrl"):
-        store.api_override = DEFAULT_API
+        console = Console(color=color, ascii_only=ascii_only,
+                          width=getattr(args, "width", None),
+                          progress=not getattr(args, "no_progress", False))
+        data_dir = resolve_data_dir(getattr(args, "data_dir", None))
+        store = Store(data_dir)
+        store.load()
+        core.report_store_problems(store, console)
+        # --api 只覆盖本次运行的地址（login / config 才会写入配置）
+        store.api_override = (getattr(args, "api", None) or "").rstrip("/")
+        # Store 是通用实现，默认站点地址属于 nflsoj；补齐 Hydro 的默认地址
+        if not store.api_override and not store.config.get("baseUrl"):
+            store.api_override = DEFAULT_API
 
-    # 需要写盘的命令先探一次数据目录，避免做完网络请求才在最后一步崩掉
-    if getattr(args, "writes", False) and not store.writable():
-        console.error("数据目录不可写：%s" % store.data_dir)
-        console.muted("该目录可能只读、被其他程序占用，或当前终端运行在受限沙箱中")
-        console.muted("换一个可写目录后重试：")
-        console.muted("hydrooj --data-dir <目录> %s" % (getattr(args, "command", "") or ""),
-                      indent=8)
-        console.muted("或设置环境变量 %s 指向可写目录" % DATA_DIR_ENV)
-        console.muted("只读命令（contests / problems / stats / export / open）不受影响")
-        return 1
+        # 需要写盘的命令先探一次数据目录，避免做完网络请求才在最后一步崩掉
+        if getattr(args, "writes", False) and not store.writable():
+            console.error("数据目录不可写：%s" % store.data_dir)
+            console.muted("该目录可能只读、被其他程序占用，或当前终端运行在受限沙箱中")
+            console.muted("换一个可写目录后重试：")
+            console.muted("hydrooj --data-dir <目录> %s" % (getattr(args, "command", "") or ""),
+                          indent=8)
+            console.muted("或设置环境变量 %s 指向可写目录" % DATA_DIR_ENV)
+            console.muted("只读命令（contests / problems / stats / export / open）不受影响")
+            return 1
 
-    handler = getattr(args, "handler", None) or cmd_dashboard
-    try:
+        handler = getattr(args, "handler", None) or cmd_dashboard
         return handler(args, store, console)
+    except SystemExit:
+        raise
     except ApiError as exc:
-        return core.report_error(console, exc)
+        return core.report_error(console or Console(color=False), exc)
     except StoreError as exc:
-        console.error(exc.message)
+        active = console or Console(color=False)
+        active.error(exc.message)
         if exc.hint:
-            console.muted(exc.hint)
+            active.muted(exc.hint)
         return 1
     except KeyboardInterrupt:
-        console.blank()
-        console.warn("已取消")
+        active = console or Console(color=False)
+        active.blank()
+        active.warn("已取消")
         return 130
     except BrokenPipeError:
+        core.silence_broken_pipe()
         return 0
+    except Exception as exc:                     # noqa: BLE001 - 兜底：不再向用户抛 traceback
+        active = console or Console(color=False)
+        active.error("内部错误：%s: %s" % (type(exc).__name__, exc))
+        if os.environ.get("HYDROOJ_TRACEBACK") or getattr(locals().get("args", None),
+                                                          "debug", False):
+            import traceback
+            traceback.print_exc()
+        else:
+            active.muted("这是工具自身的缺陷；加 --debug 或设置 HYDROOJ_TRACEBACK=1 可查看完整堆栈")
+        return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-
-
-
-
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        core.silence_broken_pipe()
+        sys.exit(0)
