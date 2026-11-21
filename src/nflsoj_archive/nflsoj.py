@@ -47,12 +47,13 @@ import time
 import unicodedata
 import urllib.parse
 import webbrowser
+from xml.etree import ElementTree as ET
 import zlib
 from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, as_completed,
                                 wait)
 from functools import lru_cache
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 DEFAULT_API = "https://nflsoi.cc:20035"
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".nflsoj")
@@ -60,6 +61,9 @@ DATA_DIR_ENV = "NFLSOJ_DATA_DIR"
 CONTEST_PAGE_SIZE = 20          # 与站点 serverPreference.pagination.contestList 保持一致
 STATEMENT_CACHE_TTL = 30 * 86400   # 题目正文本地缓存有效期（秒）
 DEFAULT_WORKERS = 8             # 实测 8 并发最稳定（16 并发反而被站点拖慢）
+DEFAULT_VIDEO_LIMIT = 3         # 归档时默认最多抓几个讲解视频（视频很大，先小批量验证）
+VIDEO_MAX_MB = 100              # 单个媒体文件默认下载上限（MB），超过则只存元信息
+VIDEO_ENABLED_DEFAULT = True    # archive 默认顺带抓视频元信息
 
 # 写盘失败时统一给出的可操作提示
 WRITE_HINT = ("该位置不可写：可能位于只读目录、被其他程序占用，"
@@ -430,6 +434,13 @@ class Console:
         self.quiet = False           # True 时连进度提示都不打印（JSON 输出用）
         self._live = None            # 当前活动的 Progress
         self._lock = threading.RLock()
+
+    def stderr(self) -> "Console":
+        """返回一个同配置、但输出到 stderr 的 Console（--json 时保持 stdout 干净）。"""
+        twin = Console(color=self.color, ascii_only=self.ascii_only, stream=sys.stderr,
+                       width=self.width, progress=False)
+        twin.quiet = True
+        return twin
 
     # -- 环境探测 ---------------------------------------------------------
     @staticmethod
@@ -1332,8 +1343,11 @@ class HttpTransport:
 
     # -- 请求 -------------------------------------------------------------
     def request(self, method: str, path: str, query=None, body=None, headers=None,
-                retries=None):
-        """返回 (status, headers, body_bytes)；4xx/5xx 不直接抛异常，由 Client 解释。"""
+                retries=None, max_body=None):
+        """返回 (status, headers, body_bytes)；4xx/5xx 不直接抛异常，由 Client 解释。
+
+        max_body 可放大单次响应体上限（媒体下载用；默认 MAX_BODY 保护 API 调用）。
+        """
         if self.offline:
             raise ApiError("已启用离线模式（--offline），该操作需要访问站点",
                            hint="去掉 --offline 后重试")
@@ -1372,7 +1386,15 @@ class HttpTransport:
                         sys.stderr.write("[debug] %s %s%s\n" % (method, self.base_url, target))
                     conn.request(method, target, body=payload, headers=send_headers)
                     resp = conn.getresponse()
-                    data = resp.read(self.MAX_BODY)
+                    limit = self.MAX_BODY if max_body is None else max(0, int(max_body))
+                    expected = resp.length        # 读之前的总长度（None 表示 chunked）
+                    data = resp.read(limit)
+                    if limit and expected is not None and expected > limit:
+                        # 明确截断时报错，而不是把半个文件当成完整文件
+                        self._drop(conn)
+                        raise ApiError(
+                            "响应体超过上限（%s），已中止" % format_size(limit), resp.status,
+                            "该地址返回的内容过大；媒体下载请调大 --video-max-mb 或换用其他来源")
                     status = resp.status
                     got_headers = {k.lower(): v for k, v in resp.getheaders()}
                     self.requests += 1
@@ -1538,11 +1560,12 @@ class Client:
                             body={"username": username, "password": password})
 
     def contest_list(self, skip=0, take=CONTEST_PAGE_SIZE, keyword=None, created_by=None):
+        # 注意：站点 2026-11 的 API 已移除 returnCount 参数（带上会 400），
+        # 但响应里仍然返回 count，翻页逻辑不受影响。
         return self.request("GET", "/api/contest/getContestList", query={
             "skipCount": int(skip),
             "takeCount": int(take),
             "keyword": keyword or None,
-            "returnCount": True,
             "createdBy": created_by or None,
         })
 
@@ -1559,6 +1582,19 @@ class Client:
             "id": int(problem_id),
             "statement": bool(statement),
         })
+
+    def video_info(self, display_uuid):
+        """讲解视频元信息（DASH 清单 / 音视频地址 / ClearKey 密钥）。
+
+        返回示例（字段可能随站点升级变化）：
+            {"displayName": "...", "status": "ready", "transcodeProgress": 100,
+             "mpdUrl": "https://.../x.mpd?X-Amz-...", "videoUrl": "...", "audioUrl": "...",
+             "keyHex": "8d30...", "keyIdHex": "88fa..."}
+        """
+        uuid = str(display_uuid or "").strip()
+        if not uuid:
+            raise ApiError("缺少视频 ID", None, "视频链接应形如 /videoshow/<uuid>")
+        return self.request("GET", "/api/video/getVideo", query={"displayUuid": uuid})
 
 
 # ---------------------------------------------------------------------------
@@ -2766,6 +2802,34 @@ def render_contest_markdown(bundle: dict) -> str:
             lines.append("- 原站题目页：%s" % site_link(contest, 1))
     lines.append("- 本地索引：[返回总目录](../index.md)")
     lines.append("")
+    videos = bundle.get("videos") or []
+    if videos:
+        lines.append("## 讲解视频")
+        lines.append("")
+        lines.append("| # | 视频 | 时长 | 状态 | 大小 | 本地文件 |")
+        lines.append("|---:|---|---:|---|---:|---|")
+        for video in videos:
+            title = md_cell(video.get("title") or "")
+            if video.get("source"):
+                title = "[%s](%s)" % (title, video["source"])
+            files = []
+            if video.get("localManifest"):
+                files.append("[清单](%s)" % video["localManifest"])
+            if video.get("localVideo"):
+                files.append("[视频](%s)" % video["localVideo"])
+            if video.get("localAudio"):
+                files.append("[音频](%s)" % video["localAudio"])
+            lines.append("| %s | %s | %s | %s | %s | %s |" % (
+                video.get("order") or "-", title, video_duration(video),
+                video.get("status") or "-",
+                format_size(video.get("totalBytes")) if video.get("totalBytes") else "-",
+                " ".join(files) or "-"))
+        lines.append("")
+        if any(video.get("encrypted") for video in videos):
+            lines.append("> 这些视频是 **CENC 加密的 DASH 流**（Shaka Packager + ClearKey）："
+                         "原站把视频与音频拆成两个文件传输。仅下载到的媒体文件需要按密钥解密后才能播放；"
+                         "详细信息（含 `keyHex`）见每个视频的元信息 JSON。")
+            lines.append("")
     lines.append("---")
     lines.append("*归档于 %s · %s · 内容以原站为准*" % (archived_at, generator))
     lines.append("")
@@ -2899,6 +2963,193 @@ def collection_counts(problems) -> dict:
     return counts
 
 
+# ---------------------------------------------------------------------------
+# 讲解视频
+# ---------------------------------------------------------------------------
+_VIDEO_LINK_RE = re.compile(
+    r"\[(?P<title>[^\]\n]{0,120})\]\(\s*(?:https?://[^/\s)]+)?/videoshow/(?P<uuid>[0-9a-fA-F-]{8,64})[^)\s]*\s*\)"
+)
+_VIDEO_BARE_RE = re.compile(r"/videoshow/(?P<uuid>[0-9a-fA-F-]{8,64})")
+VIDEO_URL_TEMPLATE = "%s/videoshow/%s"
+
+
+def extract_video_links(text) -> list:
+    """从比赛描述里提取讲解视频链接，返回 [{uuid, title, order}]（按出现顺序去重）。
+
+    站点通常把视频写成 Markdown 链接：`[20261121讲解](/videoshow/<uuid>)`。
+    也兼容裸链接、绝对地址（`https://nflsoj.cc/videoshow/<uuid>`）。
+    """
+    if not text or not isinstance(text, str):
+        return []
+    found, seen = [], set()
+    for match in _VIDEO_LINK_RE.finditer(text):
+        uuid = match.group("uuid")
+        if uuid.lower() in seen:
+            continue
+        seen.add(uuid.lower())
+        found.append({"uuid": uuid, "title": (match.group("title") or "").strip()})
+    if found:
+        # 有标准 Markdown 链接时就不再尝试裸链接，避免重复/误匹配
+        for index, item in enumerate(found, 1):
+            item["order"] = index
+        return found
+    for match in _VIDEO_BARE_RE.finditer(text):
+        uuid = match.group("uuid")
+        if uuid.lower() in seen:
+            continue
+        seen.add(uuid.lower())
+        found.append({"uuid": uuid, "title": ""})
+    for index, item in enumerate(found, 1):
+        item["order"] = index
+    return found
+
+
+def normalize_video(meta: dict, link: dict = None, base_url: str = "") -> dict:
+    """把 /api/video/getVideo 的响应规整成存档用的结构。"""
+    meta = meta if isinstance(meta, dict) else {}
+    link = link or {}
+    uuid = link.get("uuid") or ""
+    keys = [key for key in ("keyHex", "keyIdHex") if isinstance(meta.get(key), str)]
+    video = {
+        "uuid": uuid,
+        "title": (meta.get("displayName") or link.get("title") or "").strip()
+                 or ("视频 %s" % uuid[:8]),
+        "linkTitle": link.get("title") or "",
+        "order": link.get("order") or 0,
+        "status": meta.get("status") or "",
+        "progress": meta.get("transcodeProgress"),
+        "mpdUrl": meta.get("mpdUrl") or "",
+        "videoUrl": meta.get("videoUrl") or "",
+        "audioUrl": meta.get("audioUrl") or "",
+        "keyId": meta.get("keyIdHex") or "",
+        "keyHex": meta.get("keyHex") or "",
+        "encrypted": bool(keys),
+        "source": (VIDEO_URL_TEMPLATE % (base_url.rstrip("/"), uuid)) if (uuid and base_url) else "",
+        "fetchedAt": int(time.time()),
+    }
+    for field in ("duration", "durationSeconds", "width", "height", "size", "fileSize"):
+        if meta.get(field) is not None:
+            video[field] = meta[field]
+    return video
+
+
+def format_size(bytes_value) -> str:
+    """把字节数显示成人类可读的大小。"""
+    try:
+        value = float(bytes_value)
+    except (TypeError, ValueError):
+        return "-"
+    if value <= 0:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return ("%.0f %s" % (value, unit)) if unit == "B" else ("%.1f %s" % (value, unit))
+        value /= 1024.0
+    return "-"
+
+
+def video_duration(video: dict) -> str:
+    """把时长显示成 mm:ss / h:mm:ss（未知返回 "-"）。"""
+    seconds = video.get("durationSeconds") or video.get("duration")
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "-"
+    if seconds <= 0:
+        return "-"
+    seconds = int(round(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return ("%d:%02d:%02d" % (hours, minutes, secs) if hours
+            else "%d:%02d" % (minutes, secs))
+
+
+def parse_mpd(text) -> dict:
+    """从 DASH 清单里取出时长与分辨率（只需要标准库 xml）。
+
+    返回 {"durationSeconds": float|None, "width": int|None, "height": int|None}
+    """
+    info = {"durationSeconds": None, "width": None, "height": None}
+    if not text or not isinstance(text, str):
+        return info
+    try:
+        root = ET.fromstring(text.encode("utf-8"))
+    except (ET.ParseError, ValueError):
+        return info
+    ns = "{urn:mpeg:dash:schema:mpd:2011}"
+    duration = root.get("mediaPresentationDuration") or ""
+    match = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?$", duration.strip())
+    if match:
+        hours = float(match.group(1) or 0)
+        minutes = float(match.group(2) or 0)
+        seconds = float(match.group(3) or 0)
+        info["durationSeconds"] = hours * 3600 + minutes * 60 + seconds
+    for tag_name in ("Representation", "AdaptationSet"):
+        for element in root.iter():
+            if not element.tag.endswith(tag_name):
+                continue
+            width, height = element.get("width"), element.get("height")
+            if width and height:
+                try:
+                    info["width"] = int(width)
+                    info["height"] = int(height)
+                except (TypeError, ValueError):
+                    pass
+                return info
+    return info
+
+
+def video_resolution(video: dict) -> str:
+    width, height = video.get("width"), video.get("height")
+    if not width or not height:
+        return "-"
+    if height >= 2160:
+        label = "4K"
+    elif height >= 1440:
+        label = "2K"
+    elif height >= 1080:
+        label = "1080p"
+    elif height >= 720:
+        label = "720p"
+    elif height >= 480:
+        label = "480p"
+    else:
+        label = "%dp" % height
+    return "%s（%dx%d）" % (label, width, height)
+
+
+def fetch_videos(client: "Client", links, base_url: str, limit: int = DEFAULT_VIDEO_LIMIT,
+                 console: "Console" = None, with_manifest: bool = True) -> list:
+    """按顺序解析最多 limit 个视频的元信息；单个失败不影响其它。
+
+    with_manifest=True 时顺带取几 KB 的 DASH 清单，用于补全时长/分辨率。
+    """
+    videos = []
+    picked = list(links or [])[: max(0, int(limit))]
+    for link in picked:
+        try:
+            meta = client.video_info(link.get("uuid"))
+        except ApiError as exc:
+            if console is not None:
+                console.warn("视频 %s 元信息获取失败：%s"
+                             % ((link.get("uuid") or "")[:8], exc.message))
+            videos.append(normalize_video({}, link, base_url) | {"error": exc.message})
+            continue
+        video = normalize_video(meta, link, base_url)
+        if with_manifest and video.get("mpdUrl"):
+            try:
+                text = download_url(client, video["mpdUrl"],
+                                    timeout=max(client.http.timeout, 30)).decode(
+                                        "utf-8", "replace")
+                video["manifestText"] = text
+                video.update({key: value for key, value in parse_mpd(text).items()
+                              if value is not None})
+            except (ApiError, OSError, ValueError) as exc:
+                video["mpdError"] = str(exc)
+        videos.append(video)
+    return videos
+
+
 def statement_cache_payload(problem_id, detail: dict) -> dict:
     meta = detail.get("meta") if isinstance(detail.get("meta"), dict) else {}
     stats = detail.get("statistics") if isinstance(detail.get("statistics"), dict) else {}
@@ -2913,7 +3164,10 @@ def statement_cache_payload(problem_id, detail: dict) -> dict:
 def archive_one_contest(store: Store, username: str, console: Console, client: Client,
                         contest: dict, root: str, with_statements: bool = True,
                         force: bool = False, workers: int = DEFAULT_WORKERS,
-                        used_dirs=None) -> dict:
+                        used_dirs=None, with_videos: bool = VIDEO_ENABLED_DEFAULT,
+                        video_limit: int = DEFAULT_VIDEO_LIMIT,
+                        download_videos: bool = False,
+                        video_max_mb: int = VIDEO_MAX_MB) -> dict:
     """归档一场比赛，返回统计信息（不打印，由调用方汇总）。"""
     contest_id = contest.get("id")
     detail = client.contest_detail(contest_id, problems=True,
@@ -3003,12 +3257,28 @@ def archive_one_contest(store: Store, username: str, console: Console, client: C
         written += status == "written"
         unchanged += status == "unchanged"
 
+    videos_dir = os.path.join(contest_dir, "videos")
+    video_records = []
+    video_links = extract_video_links(detail.get("description"))
+    if with_videos and video_links:
+        video_records = archive_videos(
+            store, console, client, contest_id, detail.get("description"), videos_dir,
+            limit=video_limit, download_media=download_videos, max_mb=video_max_mb,
+            force=force)
+        entry["videos"] = [{"uuid": v.get("uuid"), "title": v.get("title"),
+                            "status": v.get("status"), "source": v.get("source")}
+                           for v in video_records]
+    elif video_links:
+        # 本次没抓视频，但把链接记下来，界面上仍能看到"有视频"
+        entry["videoLinks"] = video_links
+
     contest_md = render_contest_markdown({
         "contest": entry,
         "problems": problems,
         "detail": detail,
         "files": files,
         "has_statement": has_statement,
+        "videos": video_records,
         "archived_at": archived_at,
         "base_url": store.api_base,
     })
@@ -3030,12 +3300,355 @@ def archive_one_contest(store: Store, username: str, console: Console, client: C
         "files_written": written,
         "files_unchanged": unchanged,
         "done": stats[STATE_DONE],
+        "videos": len(video_records),
+        "videos_downloaded": sum(1 for v in video_records if v.get("downloaded")),
+        "video_bytes": sum(int(v.get("downloadedBytes") or 0) for v in video_records),
+        "video_failed": [v["title"] for v in video_records if v.get("error")],
     }
+
+
+DECRYPT_HELPER_PS1 = """# 讲解视频解密 / 合并助手（由 nflsoj 生成）
+#
+# 站点的视频是 CENC 加密的 DASH 流：视频与音频分别放在两个文件里，
+# 需要按 ClearKey 解密后再合并成一个可播放的 mp4。
+#
+# 前置条件：安装 ffmpeg（https://ffmpeg.org/download.html），并确保 ffmpeg 在 PATH 中。
+# 用法：在本目录打开 PowerShell，执行  .\\decrypt.ps1
+#      或逐个执行下面的命令（去掉行首的注释符号）。
+
+$ErrorActionPreference = 'Stop'
+if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {{
+    Write-Host '未找到 ffmpeg，请先安装并加入 PATH。' -ForegroundColor Red
+    exit 1
+}}
+
+{commands}
+
+Write-Host '完成：解密并合并后的文件见上面的输出。' -ForegroundColor Green
+"""
+
+DECRYPT_HELPER_SH = """#!/bin/sh
+# 讲解视频解密 / 合并助手（由 nflsoj 生成）
+#
+# 站点的视频是 CENC 加密的 DASH 流：视频与音频分别放在两个文件里，
+# 需要按 ClearKey 解密后再合并成一个可播放的 mp4。
+#
+# 前置条件：安装 ffmpeg 并确保在 PATH 中。
+# 用法：chmod +x decrypt.sh && ./decrypt.sh
+
+set -e
+command -v ffmpeg >/dev/null 2>&1 || {{ echo "未找到 ffmpeg，请先安装并加入 PATH。" ; exit 1 ; }}
+
+{commands}
+
+echo "完成。"
+"""
+
+
+def ffmpeg_decrypt_command(key_hex: str, video_file: str, audio_file: str,
+                           output: str) -> str:
+    """生成一条 ffmpeg 命令：解密 CENC 音视频并合并成 mp4。"""
+    return ('ffmpeg -y -decryption_key {key} -i "{video}" -decryption_key {key} '
+            '-i "{audio}" -map 0:v:0 -map 1:a:0 -c copy "{out}"').format(
+                key=key_hex, video=video_file, audio=audio_file, out=output)
+
+
+def write_decrypt_helper(videos_dir: str, records) -> list:
+    """为已下载媒体的视频生成解密助手脚本（Windows .ps1 + POSIX .sh）。
+
+    返回生成的文件名列表；没有可解密的组合时返回空列表。
+    """
+    lines = []
+    for record in records or []:
+        key_hex = record.get("keyHex") or ""
+        video = record.get("localVideo")
+        audio = record.get("localAudio")
+        name = record.get("title") or "video"
+        if not key_hex or not (video or audio):
+            continue
+        video_file = os.path.basename(video) if video else ""
+        audio_file = os.path.basename(audio) if audio else ""
+        stem = re.sub(r"[\\/:*?\"<>|]+", "-", name)[:60] or "video"
+        if video_file and audio_file:
+            out = "%s.decrypted.mp4" % stem
+            lines.append(ffmpeg_decrypt_command(key_hex, video_file, audio_file, out))
+        elif video_file:
+            lines.append('ffmpeg -y -decryption_key %s -i "%s" -c copy "%s.decrypted.mp4"'
+                         % (key_hex, video_file, stem))
+        else:
+            # 只有音频：输出 m4a，避免文件名暗示有画面
+            lines.append('ffmpeg -y -decryption_key %s -i "%s" -c copy "%s.decrypted.m4a"'
+                         % (key_hex, audio_file, stem))
+    if not lines:
+        return []
+    written = []
+    for filename, template in (("decrypt.ps1", DECRYPT_HELPER_PS1),
+                               ("decrypt.sh", DECRYPT_HELPER_SH)):
+        text = template.format(commands="\n".join(lines))
+        write_if_changed(os.path.join(videos_dir, filename), text)
+        written.append(filename)
+    return written
+
+
+def probe_media_size(client: "Client", url: str, timeout: int = 30):
+    """用一个 1 字节的 Range 请求探测媒体大小（S3 常拒绝 HEAD，Range 可靠）。"""
+    if not url:
+        return None
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        return None
+    origin = "%s://%s%s" % (parts.scheme, parts.hostname,
+                            ":%d" % parts.port if parts.port else "")
+    target = (parts.path or "/") + (("?" + parts.query) if parts.query else "")
+    cache = client.__dict__.setdefault("_signed_transports", {})
+    transport = cache.get(origin)
+    if transport is None:
+        transport = HttpTransport(origin, timeout=timeout, retries=1,
+                                  debug=getattr(client, "debug", False))
+        cache[origin] = transport
+    try:
+        status, headers, _data = transport.request(
+            "GET", target, headers={"Accept": "*/*", "Accept-Encoding": "identity",
+                                    "Range": "bytes=0-0"})
+    except ApiError:
+        return None
+    if status >= 400:
+        return None
+    total = None
+    content_range = headers.get("content-range") or ""
+    match = re.search(r"/(\d+)\s*$", content_range)
+    if match:
+        total = int(match.group(1))
+    if total is None:
+        try:
+            total = int(headers.get("content-length") or 0) or None
+        except (TypeError, ValueError):
+            total = None
+    return total
+
+
+def archive_videos(store: Store, console: Console, client: Client, contest_id,
+                   description: str, videos_dir: str, limit: int = DEFAULT_VIDEO_LIMIT,
+                   download_media: bool = False, max_mb: int = VIDEO_MAX_MB,
+                   force: bool = False, reldir: str = "videos") -> list:
+    """抓取并保存比赛描述里的讲解视频（默认只抓前 limit 个）。
+
+    每个视频保存：
+      * `<n>-<标题>.json`：元信息（DASH 清单地址、音视频签名地址、ClearKey 密钥、时长/分辨率）
+      * `<n>-<标题>.mpd` ：DASH 清单本体（小文件，便于日后离线解析）
+      * 可选 `<n>-<标题>.video.mp4` / `.audio.mp4`：原始媒体（CENC 加密，需按密钥解密）
+    """
+    links = extract_video_links(description)
+    if not links:
+        return []
+    ensure_archive_root(videos_dir)
+    videos = fetch_videos(client, links, store.api_base, limit=limit,
+                          console=console, with_manifest=True)
+    records = []
+    used_names = set()
+    for video in videos:
+        order = video.get("order") or len(records) + 1
+        name = "%02d-%s" % (order, slugify(video.get("title") or "", 40, "video"))
+        base_name, index = name, 2
+        while name.lower() in used_names:
+            name = "%s-%d" % (base_name, index)
+            index += 1
+        used_names.add(name.lower())
+
+        record = {"order": order, "title": video.get("title") or "",
+                  "uuid": video.get("uuid"), "files": [], "downloaded": False,
+                  "downloadedBytes": 0,
+                  "durationSeconds": video.get("durationSeconds"),
+                  "width": video.get("width"), "height": video.get("height")}
+        record.update({key: video.get(key) for key in
+                       ("status", "progress", "source", "keyHex", "keyId", "encrypted")})
+        if video.get("error"):
+            record["error"] = video["error"]
+            records.append(record)
+            continue
+
+        payload = dict(video)
+        payload.pop("manifestText", None)
+        payload["linkedFrom"] = str(contest_id)
+        payload["mpdSaved"] = False
+
+        # 媒体大小（2 个 Range 请求，几毫秒；让用户下载前心里有数）
+        video_bytes = probe_media_size(client, video.get("videoUrl"))
+        audio_bytes = probe_media_size(client, video.get("audioUrl"))
+        if video_bytes:
+            record["videoBytes"] = payload["videoBytes"] = video_bytes
+        if audio_bytes:
+            record["audioBytes"] = payload["audioBytes"] = audio_bytes
+        if video_bytes or audio_bytes:
+            total_bytes = (video_bytes or 0) + (audio_bytes or 0)
+            record["totalBytes"] = payload["totalBytes"] = total_bytes
+
+        if video.get("mpdError"):
+            payload["mpdError"] = video["mpdError"]
+            record["mpdError"] = video["mpdError"]
+        if video.get("manifestText"):
+            mpd_path = os.path.join(videos_dir, name + ".mpd")
+            write_if_changed(mpd_path, video["manifestText"])
+            payload["mpdSaved"] = True
+            record["files"].append(reldir + "/" + name + ".mpd")
+            record["localManifest"] = "%s/%s.mpd" % (reldir, name)
+
+        # 可选：下载原始媒体（体积大且是 CENC 加密的，默认关闭）
+        if download_media:
+            for kind, key in (("video", "videoUrl"), ("audio", "audioUrl")):
+                url = video.get(key) or ""
+                if not url:
+                    continue
+                target = os.path.join(videos_dir, "%s.%s.mp4" % (name, kind))
+                try:
+                    size, saved = download_url_to_file(
+                        client, url, target, max_mb=max_mb,
+                        timeout=max(client.http.timeout, 60))
+                except ApiError as exc:
+                    record.setdefault("downloadErrors", []).append("%s: %s"
+                                                                   % (kind, exc.message))
+                    continue
+                if saved:
+                    record["downloaded"] = True
+                    record["downloadedBytes"] += size
+                    record["files"].append(reldir + "/" + os.path.basename(target))
+                    record["local" + kind.capitalize()] = "%s/%s.%s.mp4" % (reldir, name, kind)
+                    if console is not None:
+                        console.muted("已下载%s：%s（%s）" % (
+                            "视频" if kind == "video" else "音频",
+                            os.path.basename(target), format_size(size)))
+                elif size:
+                    message = ("%s 文件 %.1f MB，超过 --video-max-mb=%d，已跳过"
+                               % (kind, size / 1048576.0, max_mb))
+                    record.setdefault("downloadErrors", []).append(message)
+                    if console is not None:
+                        console.warn("%s：%s" % (record["title"], message))
+                if record.get("downloadErrors"):
+                    payload["downloadErrors"] = record["downloadErrors"]
+
+        json_path = os.path.join(videos_dir, name + ".json")
+        record["filesWritten"] = write_if_changed(
+            json_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        record["files"].append(reldir + "/" + name + ".json")
+        records.append(record)
+
+    if any(record.get("downloaded") for record in records):
+        helpers = write_decrypt_helper(videos_dir, records)
+        if helpers and console is not None:
+            console.muted("已生成解密助手：%s（需要 ffmpeg；运行后得到可播放的 mp4）"
+                          % "、".join(helpers))
+    return records
+
+
+def download_url(client: "Client", url: str, timeout: int = 60) -> bytes:
+    """下载签名 URL（可能在不同主机/端口），返回原始字节（限 8MB，用于清单等小文件）。"""
+    return _fetch_signed(client, url, timeout=timeout, limit=8 * 1024 * 1024)[1]
+
+
+def download_url_to_file(client: "Client", url: str, path: str, max_mb: int = VIDEO_MAX_MB,
+                         timeout: int = 120):
+    """把签名 URL 下载到本地文件；返回 (字节数, 是否真的保存)。
+
+    超过 max_mb 时只返回大小、不下载（避免把几十上百 MB 的加密视频拉下来）。
+    """
+    total, data = _fetch_signed(client, url, timeout=timeout, probe_only_mb=max_mb)
+    if data is None:
+        return (total or 0), False
+    write_if_changed_bytes(path, data)
+    return len(data), True
+
+
+def write_if_changed_bytes(path: str, data: bytes) -> str:
+    """二进制版 write_if_changed（避免把大文件读两遍做无意义的比较）。"""
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory, exist_ok=True)
+    check_path_length(path)
+    existing = None
+    try:
+        existing = os.path.getsize(path)
+    except OSError:
+        existing = None
+    if existing == len(data):
+        return "unchanged"
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+        return "written"
+    except OSError as exc:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise StoreError("无法写入文件：%s（%s）"
+                         % (path, getattr(exc, "strerror", None) or exc), path,
+                         _write_hint(exc)) from exc
+
+
+def _fetch_signed(client: "Client", url: str, timeout: int,
+                  probe_only_mb: int = None, limit: int = None):
+    """请求签名 URL（S3/MinIO），返回 (总字节数, 内容或 None)。
+
+    - 签名 URL 与站点不同源，用独立连接池，且不带站点凭据；
+    - probe_only_mb 非空时**先用 1 字节 Range 探大小**，超过上限就不下载；
+    - limit 用于限制读取上限（清单等小文件）。
+    """
+    if not url:
+        raise ApiError("下载地址为空")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        raise ApiError("不是合法的下载地址：%s" % url)
+    origin = "%s://%s%s" % (parts.scheme, parts.hostname,
+                            ":%d" % parts.port if parts.port else "")
+    target = (parts.path or "/") + (("?" + parts.query) if parts.query else "")
+    cache = client.__dict__.setdefault("_signed_transports", {})
+    transport = cache.get(origin)
+    if transport is None:
+        transport = HttpTransport(origin, timeout=timeout, retries=2,
+                                  debug=getattr(client, "debug", False))
+        cache[origin] = transport
+    headers = {"Accept": "*/*", "Accept-Encoding": "identity"}
+
+    total = None
+    if probe_only_mb is not None:
+        # 关键：先探测，避免为了"判断是否过大"把上百 MB 整包拉下来
+        total = probe_media_size(client, url, timeout=timeout)
+        if total is not None and total > probe_only_mb * 1024 * 1024:
+            return total, None
+
+    status, resp_headers, data = transport.request(
+        "GET", target, headers=headers,
+        max_body=((probe_only_mb + 16) * 1024 * 1024) if probe_only_mb else None,
+        retries=2)
+    if status >= 400:
+        raise ApiError("下载失败（HTTP %s）" % status, status,
+                       "签名地址可能已过期；重新执行带视频的归档即可换取新地址")
+    if total is None:
+        try:
+            total = int(resp_headers.get("content-length") or 0) or None
+        except (TypeError, ValueError):
+            total = None
+    if probe_only_mb is not None and data is not None:
+        cap = probe_only_mb * 1024 * 1024
+        if len(data) > cap:            # 没探到大小又确实太大：别写进磁盘
+            return len(data), None
+    if limit is not None and data is not None:
+        data = data[:limit]
+    return total or (len(data) if data else 0), data
 
 
 def archive_contests(store: Store, username: str, console: Console, client: Client,
                      targets, root: str, with_statements: bool = True, force: bool = False,
-                     workers: int = DEFAULT_WORKERS) -> dict:
+                     workers: int = DEFAULT_WORKERS, with_videos: bool = VIDEO_ENABLED_DEFAULT,
+                     video_limit: int = DEFAULT_VIDEO_LIMIT, download_videos: bool = False,
+                     video_max_mb: int = VIDEO_MAX_MB) -> dict:
     """批量归档（逐场串行，内部并发抓题面），并刷新根目录 index.md。"""
     ensure_archive_root(root)
     results, failures = [], []
@@ -3049,7 +3662,10 @@ def archive_contests(store: Store, username: str, console: Console, client: Clie
             try:
                 result = archive_one_contest(store, username, console, client, contest, root,
                                              with_statements=with_statements, force=force,
-                                             workers=workers, used_dirs=used_dirs)
+                                             workers=workers, used_dirs=used_dirs,
+                                             with_videos=with_videos, video_limit=video_limit,
+                                             download_videos=download_videos,
+                                             video_max_mb=video_max_mb)
                 results.append(result)
             except ApiError as exc:
                 failures.append((contest.get("id"), contest.get("name"), exc.message))
@@ -3089,20 +3705,25 @@ def archive_contests(store: Store, username: str, console: Console, client: Clie
 # ---------------------------------------------------------------------------
 # 命令辅助
 # ---------------------------------------------------------------------------
-def _pick_contest(store: Store, username: str, console: Console, spec):
-    """按 ID / 名称找比赛，找不到时给出可操作的建议。"""
+def _pick_contest(store: Store, username: str, console: Console, spec, quiet: bool = False):
+    """按 ID / 名称找比赛，找不到时给出可操作的建议。
+
+    quiet=True（--json）时把候选表格打到 stderr，保证 stdout 只有 JSON。
+    """
     contest, matches = resolve_contest(store, username, spec)
     if contest is not None:
         return contest
+    sink = console.stderr() if quiet else console
     if matches:
-        console.error("匹配到 %d 场比赛，请用更精确的名称或直接使用 ID：" % len(matches))
+        sink.error("匹配到 %d 场比赛，请用更精确的名称或直接使用 ID：" % len(matches))
         rows = [[(str(c.get("id")), "grey"), (c.get("name") or "",),
                  (fmt_date(c.get("startTime")), "grey")] for c in matches[:12]]
-        console.table(["ID", "比赛名称", "开始日期"], rows,
-                      aligns=["right", "left", "left"])
-        console.muted("例如：nflsoj problems %s" % matches[0].get("id"))
+        sink.table(["ID", "比赛名称", "开始日期"], rows,
+                   aligns=["right", "left", "left"])
+        sink.muted("例如：nflsoj problems %s" % matches[0].get("id"))
         return None
-    console.error("找不到比赛：%s" % spec)
+    sink.error("找不到比赛：%s" % spec)
+    console = sink
     contests = store.all_contests(username)
     if contests:
         import difflib
@@ -3447,6 +4068,27 @@ def cmd_contests(args, store: Store, console: Console) -> int:
         wanted = {str(i) for i in args.ids}
         contests = [c for c in contests if str(c.get("id")) in wanted]
 
+    if getattr(args, "json", False):
+        payload = []
+        for contest in limit_take(contests, args.limit):
+            problems = [p for p in (contest.get("problems") or []) if isinstance(p, dict)]
+            done = sum(1 for p in problems if p.get("state") == STATE_DONE)
+            payload.append({
+                "id": contest.get("id"),
+                "name": contest.get("name"),
+                "mode": contest.get("mode"),
+                "phase": contest_phase(contest.get("startTime"), contest.get("endTime"),
+                                       contest.get("phase")),
+                "startTime": contest.get("startTime"),
+                "endTime": contest.get("endTime"),
+                "problems": len(problems),
+                "done": done,
+                "synced": bool(contest.get("syncedAt")),
+                "source": source,
+            })
+        console.out(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        return 0
+
     console.title("比赛列表", note="共 %d 场" % len(contests))
     console.kv("账号", username, value_color="bgreen")
     console.kv("数据来源", source)
@@ -3527,7 +4169,8 @@ def cmd_problems(args, store: Store, console: Console) -> int:
         console.muted("请先运行：nflsoj login")
         return 1
 
-    contest = _pick_contest(store, username, console, args.contest)
+    contest = _pick_contest(store, username, console, args.contest,
+                             quiet=bool(getattr(args, "json", False)))
     if contest is None:
         return 1
     entry = store.contest_entry(username, contest.get("id")) or store.upsert_contest(username, contest, None)
@@ -3631,7 +4274,8 @@ def cmd_mark(args, store: Store, console: Console) -> int:
         console.muted("请先运行：nflsoj login")
         return 1
 
-    contest = _pick_contest(store, username, console, args.contest)
+    contest = _pick_contest(store, username, console, args.contest,
+                             quiet=bool(getattr(args, "json", False)))
     if contest is None:
         client.close()
         return 1
@@ -3944,7 +4588,8 @@ def cmd_open(args, store: Store, console: Console) -> int:
     if not username:
         console.error("本地还没有账号数据，请先登录并同步")
         return 1
-    contest = _pick_contest(store, username, console, args.contest)
+    contest = _pick_contest(store, username, console, args.contest,
+                             quiet=bool(getattr(args, "json", False)))
     if contest is None:
         return 1
 
@@ -4045,6 +4690,116 @@ def cmd_export(args, store: Store, console: Console) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 命令：videos
+# ---------------------------------------------------------------------------
+def cmd_videos(args, store: Store, console: Console) -> int:
+    """列出 / 抓取某场比赛描述里的讲解视频（默认最多 3 个，避免一次性拉全站）。"""
+    if getattr(args, "offline", False):
+        console.error("已启用离线模式（--offline），视频信息需要访问站点")
+        console.muted("去掉 --offline 后重试")
+        return 1
+    username = store.cached_username()
+    if not username:
+        console.error("本地还没有账号数据")
+        console.muted("请先运行：nflsoj login 然后 nflsoj sync")
+        return 1
+    contest = _pick_contest(store, username, console, args.contest,
+                             quiet=bool(getattr(args, "json", False)))
+    if contest is None:
+        return 1
+
+    client = client_for(store, args)
+    try:
+        try:
+            detail = client.contest_detail(contest.get("id"), problems=False,
+                                           description=True, announcements=False)
+        except ApiError as exc:
+            return report_error(console, exc)
+        if not isinstance(detail, dict):
+            console.error("服务器返回了非预期的比赛详情结构")
+            return 1
+        description = detail.get("description") or ""
+        links = extract_video_links(description)
+        quiet = bool(getattr(args, "json", False))
+        if not quiet:
+            console.title("讲解视频", note="%s · #%s" % (contest.get("name") or "",
+                                                        contest.get("id")))
+        if not links:
+            if not quiet:
+                console.warn("这场比赛描述里没有找到讲解视频链接")
+                console.muted("视频一般写在「比赛说明」里，形如 [标题](/videoshow/<uuid>)")
+                if description.strip():
+                    console.muted("描述片段：%s" % clean_text(description)[:120])
+            else:
+                console.out(json.dumps([], ensure_ascii=False, indent=2))
+            return 0
+        limit = max(1, min(safe_int(args.limit, DEFAULT_VIDEO_LIMIT), 50))
+        if not quiet:
+            console.kv("描述里的视频", "%d 个" % len(links))
+            console.kv("本次抓取", "前 %d 个（--limit 可调）" % limit)
+            console.blank()
+
+        videos = fetch_videos(client, links, store.api_base, limit=limit,
+                              console=None if quiet else console)
+
+        if quiet:
+            console.out(json.dumps(videos, ensure_ascii=False, indent=2, default=str))
+            return 0
+
+        rows = []
+        for video in videos:
+            rows.append([
+                (str(video.get("order") or ""), "grey"),
+                (video.get("title") or "",),
+                (video_duration(video), "grey"),
+                (video_resolution(video), "grey"),
+                (video.get("status") or "-",
+                 "bgreen" if video.get("status") == "ready" else "yellow"),
+                ("是" if video.get("encrypted") else "否",
+                 "bcyan" if video.get("encrypted") else "grey"),
+                (video.get("error") or video.get("mpdError") or "",
+                 "bred" if (video.get("error") or video.get("mpdError")) else "grey"),
+            ])
+        console.table(["#", "视频", "时长", "分辨率", "状态", "加密", "备注"], rows,
+                      aligns=["right", "left", "right", "left", "left", "center", "left"])
+
+        if args.save:
+            root = os.path.abspath(os.path.expanduser(args.dir or store.archive_dir))
+            videos_dir = os.path.join(root, contest_dir_name(contest), "videos")
+            try:
+                records = archive_videos(
+                    store, console, client, contest.get("id"), description, videos_dir,
+                    limit=limit, download_media=args.download,
+                    max_mb=safe_int(args.max_mb, VIDEO_MAX_MB), force=args.force)
+            except StoreError as exc:
+                console.error(exc.message)
+                if exc.hint:
+                    console.muted(exc.hint)
+                return 1
+            console.blank()
+            downloaded = sum(1 for item in records if item.get("downloaded"))
+            total_bytes = sum(int(item.get("downloadedBytes") or 0) for item in records)
+            console.ok("已保存 %d 个视频的元信息到 %s" % (len(records), videos_dir))
+            if downloaded:
+                console.muted("其中 %d 个下载了媒体文件（共 %s）"
+                              % (downloaded, format_size(total_bytes)))
+            console.muted("每个视频一份 JSON（含 keyHex / 签名地址）+ DASH 清单 .mpd")
+            return 0
+
+        console.blank()
+        console.muted("保存元信息：nflsoj videos %s --save" % contest.get("id"))
+        console.muted("同时下载媒体：nflsoj videos %s --save --download（体积很大）"
+                      % contest.get("id"))
+        console.muted("归档时自动抓取前 %d 个：nflsoj archive %s"
+                      % (DEFAULT_VIDEO_LIMIT, contest.get("id")))
+        if any(video.get("encrypted") for video in videos):
+            console.muted("提示：这些视频是 CENC 加密的 DASH 流，下载到的媒体需按 keyHex 解密后播放")
+        return 0
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------
 # 命令：archive
 # ---------------------------------------------------------------------------
 def cmd_archive(args, store: Store, console: Console) -> int:
@@ -4071,7 +4826,8 @@ def cmd_archive(args, store: Store, console: Console) -> int:
     if args.contest:
         targets = []
         for spec in args.contest:
-            contest = _pick_contest(store, username, console, spec)
+            contest = _pick_contest(store, username, console, spec,
+                             quiet=bool(getattr(args, "json", False)))
             if contest is not None:
                 targets.append(contest)
         if not targets:
@@ -4110,7 +4866,11 @@ def cmd_archive(args, store: Store, console: Console) -> int:
     try:
         result = archive_contests(store, username, console, client, targets, root,
                                  with_statements=document, force=args.force,
-                                 workers=args.workers)
+                                 workers=args.workers,
+                                 with_videos=not getattr(args, "no_videos", False),
+                                 video_limit=getattr(args, "video_limit", DEFAULT_VIDEO_LIMIT),
+                                 download_videos=getattr(args, "video_download", False),
+                                 video_max_mb=getattr(args, "video_max_mb", VIDEO_MAX_MB))
     except ApiError as exc:
         return report_error(console, exc)
     except StoreError as exc:
@@ -4131,6 +4891,9 @@ def cmd_archive(args, store: Store, console: Console) -> int:
                 "problems": item["problems"],
                 "statements": item["statements"],
                 "failed": item["failed"],
+                "videos": item.get("videos", 0),
+                "videosDownloaded": item.get("videos_downloaded", 0),
+                "videoBytes": item.get("video_bytes", 0),
             } for item in result["results"]],
             "failures": [{"id": cid, "name": name, "error": msg}
                          for cid, name, msg in result["failures"]],
@@ -4144,23 +4907,34 @@ def cmd_archive(args, store: Store, console: Console) -> int:
         rows = []
         for item in result["results"]:
             failed = len(item["failed"])
+            videos = int(item.get("videos") or 0)
+            video_cell = str(videos) if videos else "-"
+            if videos and item.get("videos_downloaded"):
+                video_cell = "%d（下载 %d）" % (videos, item["videos_downloaded"])
             rows.append([
                 (str(item["contest"].get("id")), "grey"),
                 (item["contest"].get("name") or "",),
                 (str(item["problems"]),),
                 (str(item["statements"]), "bgreen" if item["statements"] else "grey"),
+                (video_cell, "bcyan" if videos else "grey"),
                 (str(failed), "bred" if failed else "grey"),
                 (item["dir"], "grey"),
             ])
-        console.table(["ID", "比赛", "题目", "题面", "失败", "归档目录"], rows,
-                      aligns=["right", "left", "right", "right", "right", "left"])
+        console.table(["ID", "比赛", "题目", "题面", "视频", "失败", "归档目录"], rows,
+                      aligns=["right", "left", "right", "right", "right", "right", "left"])
         problems = sum(item["problems"] for item in result["results"])
         statements = sum(item["statements"] for item in result["results"])
         written = sum(item["files_written"] for item in result["results"])
         unchanged = sum(item["files_unchanged"] for item in result["results"])
+        videos = sum(int(item.get("videos") or 0) for item in result["results"])
+        video_bytes = sum(int(item.get("video_bytes") or 0) for item in result["results"])
         console.blank()
         console.ok("已归档 %d 场比赛、%d 道题目（题面 %d 份）到 %s" % (
             len(result["results"]), problems, statements, result["root"]))
+        if videos:
+            extra = ("（含媒体 %s）" % format_size(video_bytes)) if video_bytes else ""
+            console.muted("顺带抓取 %d 个讲解视频的元信息%s；"
+                          "加 --video-download 可下载媒体文件" % (videos, extra))
         console.muted("新增/更新 %d 个文件，%d 个文件内容未变（已跳过写入）" % (written, unchanged))
     if result["failures"]:
         console.warn("%d 场比赛归档失败：" % len(result["failures"]))
@@ -4407,6 +5181,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keyword", help="按名称过滤")
     p.add_argument("--phase", choices=["not_started", "running", "ended", "unknown"], help="按状态过滤")
     p.add_argument("--ids", nargs="*", type=int, metavar="ID", help="只显示指定 ID")
+    p.add_argument("--json", action="store_true", help="以 JSON 输出比赛列表")
     p.add_argument("--limit", type=arg_int_min(0), default=50, metavar="N",
                    help="最多显示多少场（默认 50；0 = 全部）")
     p.set_defaults(handler=cmd_contests)
@@ -4479,7 +5254,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="并发抓取题面的线程数（默认 %d）" % DEFAULT_WORKERS)
     p.add_argument("--open", action="store_true", help="归档完成后打开总目录")
     p.add_argument("--json", action="store_true", help="以 JSON 输出归档结果")
+    p.add_argument("--no-videos", action="store_true",
+                   help="不抓比赛描述里的讲解视频（默认抓前 %d 个元信息）" % DEFAULT_VIDEO_LIMIT)
+    p.add_argument("--video-limit", type=arg_int_min(0), default=DEFAULT_VIDEO_LIMIT,
+                   metavar="N", help="每场最多抓几个视频（默认 %d，0 = 不抓）"
+                   % DEFAULT_VIDEO_LIMIT)
+    p.add_argument("--video-download", action="store_true",
+                   help="同时下载视频/音频原始文件（CENC 加密，单个数十 MB，默认关闭）")
+    p.add_argument("--video-max-mb", type=arg_int_min(1), default=VIDEO_MAX_MB,
+                   metavar="N", help="单个媒体文件下载上限（默认 %d MB，超过则只存元信息）"
+                   % VIDEO_MAX_MB)
     p.set_defaults(handler=cmd_archive, writes=True)
+
+    p = sub.add_parser("videos", parents=[common], aliases=["vid"],
+                       help="查看 / 保存比赛描述里的讲解视频",
+                       description="解析「比赛说明」里的讲解视频链接（/videoshow/<uuid>），"
+                                   "查询元信息；默认只查前 %d 个，避免一次拉全站。" % DEFAULT_VIDEO_LIMIT)
+    p.add_argument("contest", help="比赛 ID（或唯一前缀 / 名称关键词）")
+    p.add_argument("--limit", type=arg_int_min(1), default=DEFAULT_VIDEO_LIMIT, metavar="N",
+                   help="最多查询几个视频（默认 %d）" % DEFAULT_VIDEO_LIMIT)
+    p.add_argument("--save", action="store_true",
+                   help="把元信息与 DASH 清单保存到归档目录")
+    p.add_argument("--download", action="store_true",
+                   help="配合 --save 下载音视频原始文件（加密且体积大）")
+    p.add_argument("--max-mb", type=arg_int_min(1), default=VIDEO_MAX_MB, metavar="N",
+                   help="单个媒体文件下载上限（默认 %d MB）" % VIDEO_MAX_MB)
+    p.add_argument("--dir", metavar="DIR", help="配合 --save 的归档目录")
+    p.add_argument("--force", action="store_true", help="忽略已有文件，强制重新抓取")
+    p.add_argument("--json", action="store_true", help="以 JSON 输出视频元信息")
+    p.set_defaults(handler=cmd_videos, writes=True)
 
     return parser
 

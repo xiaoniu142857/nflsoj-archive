@@ -1,6 +1,6 @@
 [project]
 name = "nflsoj-archive"
-version = "1.2.0"
+version = "1.3.0"
 description = "OJ 命令行工具集：同步比赛与题目、标记做题进度、把比赛与题面归档成本地 Markdown（支持 NFLSOJ 与 Hydro）"
 readme = "README.md"
 authors = [

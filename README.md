@@ -51,7 +51,9 @@
   - [`open` — 浏览器打开](#open--浏览器打开)
   - [`export` — 导出做题记录](#export--导出做题记录)
   - [`archive` — Markdown 归档](#archive--markdown-归档)
+  - [`videos` — 讲解视频](#videos--讲解视频)
 - [Markdown 归档详解](#markdown-归档详解)
+- [讲解视频](#讲解视频)
 - [离线模式](#离线模式)
 - [性能](#性能)
 - [从 1.0 升级](#从-10-升级)
@@ -77,6 +79,8 @@
   按比赛维度统计、最近标记记录。
 - **本地 Markdown 归档**：每场比赛生成「比赛首页 + 每题一份题面」，自动生成总目录 `index.md`，
   带 YAML front matter、相对链接与原始链接。
+- **讲解视频**：从「比赛说明」里解析 `/videoshow/<uuid>` 链接，抓取标题、时长、分辨率、
+  DASH 清单与 ClearKey 密钥；默认每场只取前 3 个，媒体文件按需下载并附解密助手脚本。
 - **离线模式**：`--offline` 下只读本地数据，绝不发起任何请求；`stats` / `export` 等命令
   本来就不联网，毫秒级返回。
 - **终端渲染**：256 色状态徽标、按东亚字符宽度对齐的表格、单行实时进度条（含速率与剩余时间）；
@@ -85,8 +89,9 @@
 - **健壮性**：5xx / 429 自动重试（指数退避）、超时与证书错误的中文提示、原子写入本地 JSON、
   归档时内容未变则不重写文件。
 
-> 以上特性对 **`hydrooj`**（Hydro 版）同样成立；Hydro 特有的差异见
-> [Hydro 版：hydrooj](#hydro-版hydrooj)。
+> 以上特性除**讲解视频**外，对 **`hydrooj`**（Hydro 版）同样成立
+> （Hydro 没有 `/api/video/getVideo`，所以 `hydrooj` 没有 `videos` 命令）；
+> Hydro 特有的差异见 [Hydro 版：hydrooj](#hydro-版hydrooj)。
 
 ---
 
@@ -285,7 +290,8 @@ nflsoj logout     # 清除本地登录凭据（做题标记与归档文件都保
 | `stats` | `st` | 否 | 做题情况统计 |
 | `open` | `o` | 否 | 在浏览器中打开比赛 / 题目 |
 | `export` | | 否 | 导出做题记录（md / csv / json） |
-| `archive` | `arc` | 是 | 把比赛首页与题面归档成本地 Markdown |
+| `archive` | `arc` | 是 | 把比赛首页与题面归档成本地 Markdown（顺带抓讲解视频元信息） |
+| `videos` | `vid` | 是 | 查看 / 保存比赛说明里的讲解视频 |
 
 「视情况」表示：优先使用本地缓存，只有缓存缺失或显式要求刷新时才联网。
 
@@ -605,6 +611,9 @@ nflsoj archive 2643 --force             # 忽略题面缓存，强制重新抓�
 nflsoj archive --all --workers 4        # 并发抓题面的线程数（默认 8）
 nflsoj archive 2643 --open              # 归档完成后打开总目录
 nflsoj archive 2643 --json              # 以 JSON 输出结果（stdout 只有 JSON）
+nflsoj archive 2643 --no-videos         # 不抓讲解视频
+nflsoj archive 2643 --video-limit 2     # 每场最多抓 2 个视频（默认 3）
+nflsoj archive 2643 --video-download    # 连媒体文件一起下载（几十 MB，默认关闭）
 ```
 
 | 参数 / 选项 | 说明 |
@@ -620,11 +629,59 @@ nflsoj archive 2643 --json              # 以 JSON 输出结果（stdout 只有 
 | `--workers N` | 并发抓取题面的线程数（默认 `8`，内部上限 12） |
 | `--open` | 归档完成后打开总目录 `index.md` |
 | `--json` | 以 JSON 输出归档结果（自动关闭进度条，保证 stdout 干净） |
+| `--no-videos` | 不抓比赛说明里的讲解视频 |
+| `--video-limit N` | 每场最多抓几个讲解视频（默认 `3`，`0` 等同 `--no-videos`） |
+| `--video-download` | 连音视频原始文件一起下载（CENC 加密、单个数十 MB，默认关闭） |
+| `--video-max-mb N` | 单个媒体文件的下载上限（默认 `100` MB，超过则只存元信息） |
 
 不带位置参数时必须给出 `--all`、`--keyword`、`--phase`、`--limit` 之一，否则报错并提示用法。
 运行时会打印每场比赛的「ID / 比赛 / 题目 / 题面 / 失败 / 归档目录」结果表，
 以及「新增/更新 N 个文件，M 个文件内容未变（已跳过写入）」。
 生成结构与细节见下一节。
+
+---
+
+### `videos` — 讲解视频
+
+站点把每次讲解的视频挂在**「比赛说明」**里，形如 `[20261121讲解](/videoshow/<uuid>)`。
+`videos` 解析这些链接并查询视频元信息；为了避免一次拉全站，**默认只看前 3 个**。
+
+```bash
+nflsoj videos 2647                      # 看这场比赛说明里的视频（默认前 3 个）
+nflsoj videos 2647 --limit 1            # 只看第 1 个
+nflsoj videos 2647 --save               # 存元信息 + DASH 清单到归档目录
+nflsoj videos 2647 --save --download    # 连媒体文件一起下载（体积很大）
+nflsoj videos 2647 --save --download --max-mb 40   # 只下载小于 40MB 的文件
+nflsoj videos 2647 --json               # 以 JSON 输出（stdout 只有 JSON）
+```
+
+| 参数 / 选项 | 说明 |
+|---|---|
+| `SPEC`（位置参数） | 比赛 ID（或唯一前缀 / 名称关键词） |
+| `--limit N` | 最多查询几个视频（默认 `3`，上限 50） |
+| `--save` | 把元信息（JSON）与 DASH 清单（`.mpd`）保存到 `<归档目录>/<比赛>/videos/` |
+| `--download` | 配合 `--save`，额外下载音视频原始文件 |
+| `--max-mb N` | 单个媒体文件下载上限（默认 `100` MB） |
+| `--dir DIR` | 配合 `--save` 的归档目录（默认 `<数据目录>/archive`） |
+| `--force` | 强制重新抓取（默认已存在的文件内容不变时不重写） |
+| `--json` | 以 JSON 输出视频元信息 |
+
+输出示例：
+
+```text
+┌─ 讲解视频 ─────────────────────────────────────────────── S+数位DP · #2647 ┐
+  描述里的视频 1 个
+  本次抓取     前 3 个（--limit 可调）
+
+┌───┬──────────────────┬─────────┬────────────────────┬───────┬──────┬──────┐
+│ # │ 视频             │    时长 │ 分辨率             │ 状态  │ 加密 │ 备注 │
+├───┼──────────────────┼─────────┼────────────────────┼───────┼──────┼──────┤
+│ 1 │ S+数位DP20261117 │ 1:25:22 │ 1080p（2160x1080） │ ready │  是  │      │
+└───┴──────────────────┴─────────┴────────────────────┴───────┴──────┴──────┘
+```
+
+`archive` 默认也会为每场比赛顺带抓前 3 个视频的元信息（表格里多一列「视频」），
+用 `--no-videos` 关掉。
 
 ---
 
@@ -795,6 +852,96 @@ generator: "nflsoj 1.1.0"
 
 ---
 
+## 讲解视频
+
+站点的讲解视频**不在题目里，而在「比赛说明」里**，通常是一行 Markdown 链接：
+
+```markdown
+[S+数位DP20261117](/videoshow/a9ba0323-bbc2-43c6-a299-6f7a7f9baa2c)
+```
+
+`nflsoj` 会把这类链接解析出来，查 `/api/video/getVideo?displayUuid=<uuid>` 拿到元信息。
+**默认只抓前 3 个**（21 场比赛里 39 场都有视频，全抓既慢又占空间），
+`--limit` 可调，`--no-videos` 可关。
+
+### 站点视频的实际形态
+
+站点用 [Shaka Packager](https://github.com/shaka-project/shaka-packager) 把每次讲解转成
+**DASH + ClearKey（CENC）加密**的流：
+
+| 字段 | 含义 |
+|---|---|
+| `displayName` | 视频标题（如 `20261121讲解`） |
+| `status` / `transcodeProgress` | 转码状态，`ready` + 100 表示可播放 |
+| `mpdUrl` | DASH 清单（几分钟内有效？不是——签名有效期约 **20 小时**） |
+| `videoUrl` / `audioUrl` | 视频轨 / 音频轨的**签名直链**（MinIO，AES 加密） |
+| `keyIdHex` / `keyHex` | ClearKey 的 KID 与**解密密钥**（php 端直接下发） |
+
+也就是说：一堂 43 分钟的课被拆成「视频轨 + 音频轨」两个 mp4 容器，
+两者都用同一个 `keyHex` 做 AES-CTR 加密。**只下载原始文件是打不开的**，
+必须先解密、再合并。
+
+### 保存的内容
+
+`videos --save`（或 `archive`）会在 `<归档目录>/<比赛>/videos/` 下生成：
+
+```text
+2647-S+数位DP/videos/
+├── 01-S+数位DP20261117.json      # 元信息：标题、时长、分辨率、清单/直链、keyHex、体积
+├── 01-S+数位DP20261117.mpd       # DASH 清单（2 KB，离线也能看清流结构）
+├── 01-….video.mp4                # 可选：--download 才有（CENC 加密，几十 MB）
+├── 01-….audio.mp4                # 可选：同上
+├── decrypt.ps1                   # 可选：Windows 解密/合并助手（需 ffmpeg）
+└── decrypt.sh                    # 可选：POSIX 版
+```
+
+JSON 里除了 URL，还有 **`keyHex`**——这是把视频变成可播放文件的关键。
+签名直链约 20 小时后失效，但 `keyHex` 与 `.mpd` 长期有效，
+失效后重新跑一次 `nflsoj videos <id> --save` 即可换取新地址。
+
+### 让下载到的视频可播放（需要 ffmpeg）
+
+本项目**零依赖、不内置解密**（纯 Python 做 CENC 解密 + mp4 重封装不现实）。
+下载媒体后，工具会生成 `decrypt.ps1` / `decrypt.sh`，装好
+[ffmpeg](https://ffmpeg.org/download.html) 后直接运行即可：
+
+```powershell
+cd ~\.nflsoj\archive\2647-S+数位DP\videos
+.\decrypt.ps1
+```
+
+脚本里实际执行的命令（每个视频一行）：
+
+```bash
+ffmpeg -y -decryption_key <keyHex> -i "01-x.video.mp4" \
+       -decryption_key <keyHex> -i "01-x.audio.mp4" \
+       -map 0:v:0 -map 1:a:0 -c copy "x.decrypted.mp4"
+```
+
+没有 ffmpeg 时，也可以把 `.mpd` + `keyHex` 交给支持 ClearKey 的播放器
+（如 Shaka Player Demo、带插件的 VLC）。
+
+### 体积与时间参考
+
+| 项目 | 实测 |
+|---|---|
+| 单个视频（1080p，43 分钟） | 视频轨 ~112 MB + 音频轨 ~77 MB，共 ~190 MB |
+| 下载速度 | 约 1 MB/s（取决于到 MinIO 的网络），单个视频 1.5~3 分钟 |
+| 只存元信息 + 清单 | 每个视频 ~4 KB，1 秒内完成 |
+
+因此：**默认只存元信息**；确实要离线看再用 `--download`，并用 `--max-mb` 卡住上限
+（默认 100 MB，超过就跳过并说明原因，不会静默下半个文件）。
+
+### 常见问题
+
+- **`描述里的视频 0 个`**：这场比赛说明里没有视频链接，或者视频写在了题目正文里
+  （目前只从比赛说明解析）。
+- **`status` 不是 `ready`**：站点还在转码，过几小时再试。
+- **下载报 `HTTP 403`**：签名过期了，重新 `videos --save --download` 换新地址。
+- **`video 文件 111.5 MB，超过 --video-max-mb=100，已跳过`**：按提示调大上限即可。
+
+---
+
 ## 离线模式
 
 `--offline` 表示「只用本地数据」：任何需要访问站点的操作都会立刻失败，而不是静默联网。
@@ -875,6 +1022,20 @@ nflsoj --offline export -o 记录.md
 ---
 
 ## 从 1.0 升级
+
+### 1.2 → 1.3
+
+1.3.0 新增**讲解视频**抓取，并修掉一次站点 API 变更导致的失效：
+
+| 变更 | 1.2 | 1.3 |
+|---|---|---|
+| 讲解视频 | 只有题面，视频链接留在说明里没处理 | 新增 `videos` 命令；`archive` 默认顺带抓前 3 个视频的元信息与 DASH 清单 |
+| 媒体下载 | 无 | `--video-download` / `--max-mb`（默认只存元信息，媒体按需下载） |
+| 解密 | 无 | 下载后自动生成 `decrypt.ps1` / `decrypt.sh`（需 ffmpeg） |
+| `getContestList` | 带 `returnCount` 参数 | 站点 2026-11 起**拒绝该参数（400）**，已移除；响应中的 `count` 仍然可用 |
+
+> ⚠️ 如果你在用旧版本，`sync` / `contests --live` 会因 `property returnCount should not exist`
+> 失败——那是站点 API 变更，升级到 1.3.0 即可。
 
 ### 1.2.0 稳定性加固（同一版本内的修补）
 
@@ -980,6 +1141,7 @@ nflsoj archive --all         # 首次建立本地 Markdown 存档
 └── archive/             # archive 命令的默认输出目录
     ├── index.md
     └── 2643-S+线段树/…
+        └── videos/      # 讲解视频元信息 / DASH 清单 /（可选）媒体文件
 ```
 
 | 路径 | 职责 |
@@ -988,6 +1150,7 @@ nflsoj archive --all         # 首次建立本地 Markdown 存档
 | `progress.json` | 按用户名分区的比赛缓存、题目列表、本地标记（`state` / `stateUpdatedAt`）、同步时间、归档元数据 |
 | `cache/statements/` | 按题目 ID 缓存的题面 JSON，供 `archive` 复用，避免重复抓取 |
 | `archive/` | 归档生成的 Markdown（可用 `--dir` 或 `config --set-archive-dir` 指向别处） |
+| `archive/<比赛>/videos/` | 讲解视频的元信息 JSON（含 `keyHex`）、DASH 清单 `.mpd`，以及 `--video-download` 时的媒体文件与解密助手脚本 |
 
 `config.json` 结构示意：
 
@@ -1066,9 +1229,14 @@ nflsoj archive --all         # 首次建立本地 Markdown 存档
 |---|---|---|---|
 | `GET` | `/api/auth/getSessionInfo` | — | `{userMeta, isManager, serverPreference, serverVersion, ...}` |
 | `POST` | `/api/auth/login` | body `{username, password}` | `{token, username, userId}` 或 `{error}` |
-| `GET` | `/api/contest/getContestList` | `skipCount`, `takeCount`, `keyword`, `returnCount`（另支持 `createdBy`） | `{contests: [...], count}` |
+| `GET` | `/api/contest/getContestList` | `skipCount`, `takeCount`, `keyword`（另支持 `createdBy`；**`returnCount` 已被站点移除，带上会 400**） | `{contests: [...], count}` |
 | `GET` | `/api/contest/getContest` | `contestId`, `description`, `problemInfos`, `announcements` | `{meta, problemInfos, description, announcements, permissions, ...}` |
 | `GET` | `/api/problem/getProblem` | `id`, `statement` | `{meta: {id, title}, statement, statistics, ...}` |
+| `GET` | `/api/video/getVideo` | `displayUuid`（注意不是 `videoId`） | `{displayName, status, transcodeProgress, mpdUrl, videoUrl, audioUrl, keyHex, keyIdHex}` |
+
+视频接口返回的 `mpdUrl` / `videoUrl` / `audioUrl` 是 **MinIO 的签名直链**（有效期约 20 小时），
+与站点不同源，工具会为它们单独建连接且**不发送站点凭据**；`keyHex` 是 ClearKey 解密密钥。
+媒体文件是 CENC 加密的 DASH 分轨，播放前需要解密 + 合并（详见「讲解视频」一章）。
 
 要点：
 

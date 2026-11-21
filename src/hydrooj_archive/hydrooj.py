@@ -44,7 +44,7 @@ except ImportError:                     # 直接 python src/hydrooj_archive/hydr
     sys.path.insert(0, os.path.dirname(_HERE))
     from nflsoj_archive import nflsoj as core
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 DEFAULT_API = "http://nflsoi.cc:10611"
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".hydrooj")
