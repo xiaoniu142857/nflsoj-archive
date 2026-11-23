@@ -32,6 +32,8 @@ import csv
 import datetime as _dt
 import errno
 import gzip
+import hashlib
+import html.parser
 import http.client
 import io
 import json
@@ -53,7 +55,7 @@ from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, as_complete
                                 wait)
 from functools import lru_cache
 
-__version__ = "1.3.0"
+__version__ = "2.1.0"
 
 DEFAULT_API = "https://nflsoi.cc:20035"
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".nflsoj")
@@ -64,6 +66,54 @@ DEFAULT_WORKERS = 8             # 实测 8 并发最稳定（16 并发反而被�
 DEFAULT_VIDEO_LIMIT = 3         # 归档时默认最多抓几个讲解视频（视频很大，先小批量验证）
 VIDEO_MAX_MB = 100              # 单个媒体文件默认下载上限（MB），超过则只存元信息
 VIDEO_ENABLED_DEFAULT = True    # archive 默认顺带抓视频元信息
+
+CPRET_API = "https://cpret.online/api/search"
+CPRET_ORIGIN = "https://cpret.online"
+ORIGIN_THRESHOLD_DEFAULT = 0.7      # 相似度严格大于该值才算命中原题
+ORIGIN_MAX_QUERY = 8000             # 送入 CPRet 的题面最大字符数（超出截断）
+ORIGIN_CACHE_DAYS = 14.0            # CPRet 结果缓存有效期（天）
+ORIGIN_TIMEOUT = 60                 # 单次查询超时（秒）；CPRet 通常 1 秒内返回
+ORIGIN_DELAY_DEFAULT = 0.4          # 并发查询之间的最小间隔（秒），避免触发限流
+ORIGIN_WORKERS_DEFAULT = 2
+ORIGIN_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/143.0 Safari/537.36")
+
+# CPRet 的 OJ 名 → VJudge 的 OJ 键（VJudge 题单里用的名字，见 vjudge.net/util/cfg）
+VJUDGE_SOURCES = {
+    "Aizu": "Aizu", "AIZU": "Aizu",
+    "AtCoder": "AtCoder",
+    "BZOJ": "BZOJ", "HYSBZ": "BZOJ",
+    "CodeChef": "CodeChef",
+    "Codeforces": "CodeForces", "CodeForces": "CodeForces",
+    "CodeforcesGym": "Gym", "Gym": "Gym",
+    "LibreOJ": "LibreOJ",
+    "Luogu": "洛谷",
+    "Nowcoder": "牛客", "NowCoder": "牛客",
+    "QOJ": "QOJ",
+    "SPOJ": "SPOJ",
+    "UOJ": "UniversalOJ", "UniversalOJ": "UniversalOJ",
+    "CSES": "CSES",
+    "HDU": "HDU",
+    "POJ": "POJ",
+    "UVA": "UVA",
+    "UVALive": "UVALive",
+    "ZOJ": "ZOJ",
+    "51Nod": "51Nod",
+    "HihoCoder": "HihoCoder",
+    "Kattis": "Kattis",
+    "TopCoder": "TopCoder",
+    "Yukicoder": "Yukicoder",
+    "Baekjoon": "Baekjoon",
+}
+# VJudge 上已停服、无法取题的 OJ
+VJUDGE_DEAD = {"BZOJ": "VJudge 的 BZOJ 已停止服务"}
+# CPRet 收录但 VJudge 不支持的数字题号来源
+VJUDGE_UNSUPPORTED = {
+    "Hydro": "VJudge 不支持 Hydro 题号",
+    "LeetCode": "VJudge 不支持 LeetCode 题号",
+}
+
+
 
 # 写盘失败时统一给出的可操作提示
 WRITE_HINT = ("该位置不可写：可能位于只读目录、被其他程序占用，"
@@ -273,6 +323,21 @@ def arg_int_min(minimum, name: str = "该参数"):
                 "%s 不能小于 %d，收到 %d" % (name, minimum, value))
         return value
     parse.__name__ = "int_min_%d" % minimum
+    return parse
+
+
+def arg_float_range(minimum, maximum, name: str = "该参数"):
+    """生成 argparse 的 float 校验器（同 arg_int_range，但允许小数）。"""
+    def parse(raw):
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError("%s 需要数字，收到 %r" % (name, raw))
+        if value < minimum or value > maximum:
+            raise argparse.ArgumentTypeError(
+                "%s 需要在 %s..%s 之间，收到 %s" % (name, minimum, maximum, value))
+        return value
+    parse.__name__ = "float_%s_%s" % (minimum, maximum)
     return parse
 
 
@@ -1743,6 +1808,56 @@ class Store:
         return os.path.join(self.data_dir, "cache")
 
     @property
+    def origin_cache_dir(self) -> str:
+        """CPRet 原始查询结果缓存目录（按查询文本哈希命名）。"""
+        return os.path.join(self.data_dir, "cache", "cpret")
+
+    def origin_cache_path(self, query_id: str) -> str:
+        return os.path.join(self.origin_cache_dir, "%s.json" % safe_cache_name(query_id))
+
+    def load_origin_cache(self, query_id: str, ttl: float = ORIGIN_CACHE_DAYS):
+        """读取 CPRet 结果缓存；过期或损坏返回 None。"""
+        payload = self._read_json(self.origin_cache_path(query_id), None)
+        if not isinstance(payload, dict) or not isinstance(payload.get("candidates"), list):
+            return None
+        fetched = payload.get("fetchedAt")
+        try:
+            fetched = float(fetched) if fetched is not None else 0.0
+        except (TypeError, ValueError):
+            fetched = 0.0
+        if ttl and (not fetched or time.time() - fetched > ttl * 86400):
+            return None
+        return payload
+
+    def save_origin_cache(self, query_id: str, payload: dict) -> None:
+        self._ensure_dir(self.origin_cache_dir)
+        data = dict(payload)
+        data["fetchedAt"] = int(time.time())
+        self._write_json(self.origin_cache_path(query_id), data)
+
+    def set_origin(self, username: str, contest_id, problem_id, record: dict) -> bool:
+        """把某题的原题判定写进 progress.json。"""
+        entry = self.contest_entry(username, contest_id)
+        if not entry:
+            return False
+        for problem in entry.get("problems") or []:
+            if not isinstance(problem, dict):
+                continue
+            if str(problem.get("problemId")) == str(problem_id):
+                problem["origin"] = record
+                self.dirty = True
+                return True
+        return False
+
+    def problem_origin(self, username: str, contest_id, problem_id):
+        entry = self.contest_entry(username, contest_id)
+        for problem in (entry or {}).get("problems") or []:
+            if isinstance(problem, dict) and str(problem.get("problemId")) == str(problem_id):
+                origin = problem.get("origin")
+                return origin if isinstance(origin, dict) else None
+        return None
+
+    @property
     def statement_cache_dir(self) -> str:
         return os.path.join(self.cache_dir, "statements")
 
@@ -1908,6 +2023,10 @@ class Store:
                     if problem.get("state") not in (None,) + tuple(STATE_ORDER):
                         problem.pop("state", None)
                         problem.pop("stateUpdatedAt", None)
+                    if "origin" in problem and not isinstance(problem.get("origin"), dict):
+                        problem.pop("origin", None)
+                        self.structure_warnings.append(
+                            "比赛 %s 的题目原题记录不是对象，已丢弃" % key)
                     cleaned.append(problem)
                 entry["problems"] = cleaned
 
@@ -2006,7 +2125,7 @@ class Store:
                 old = previous.get(str(item.get("problemId")))
                 record = dict(item)
                 if old:
-                    for keep in ("state", "stateUpdatedAt"):
+                    for keep in ("state", "stateUpdatedAt", "origin"):
                         if old.get(keep):
                             record[keep] = old[keep]
                     if old.get("submitted"):
@@ -2858,6 +2977,8 @@ def render_problem_markdown(bundle: dict) -> str:
     else:
         source = (contest_link(base_url, contest.get("id"), problem.get("displayOrder"))
                   if base_url else "")
+    origin = bundle.get("origin") or (problem.get("origin")
+                                      if isinstance(problem.get("origin"), dict) else {})
     pairs = [
         ("title", problem.get("title") or ""),
         ("problem_id", problem.get("problemId")),
@@ -2872,6 +2993,8 @@ def render_problem_markdown(bundle: dict) -> str:
         ("submitted_users", problem.get("numSubmittedUsers")),
         ("archived_at", archived_at),
         ("source", source),
+        ("origin", origin.get("vjudgeId")),
+        ("origin_score", origin.get("score") if origin else None),
         ("generator", generator),
     ]
     lines = [build_front_matter(pairs), "",
@@ -2899,6 +3022,33 @@ def render_problem_markdown(bundle: dict) -> str:
     if extras:
         lines.append("  \n".join(extras))     # 两空格换行，保证渲染成分行
         lines.append("")
+    if origin and origin.get("matched"):
+        lines.append("## 原题")
+        lines.append("")
+        lines.append("- VJudge 题号：`%s`" % (origin.get("vjudgeId") or "无（来源不支持）"))
+        if origin.get("title"):
+            link = origin.get("url") or ""
+            if link:
+                lines.append("- 原题：%s" % md_link(md_cell(origin["title"]), link))
+            else:
+                lines.append("- 原题：%s" % md_cell(origin["title"]))
+        lines.append("- 相似度：%s（阈值 %s）" % (
+            ("%.4f" % origin["score"]) if isinstance(origin.get("score"), (int, float)) else "-",
+            ("%.2f" % origin["threshold"]) if isinstance(origin.get("threshold"), (int, float))
+            else "-"))
+        if origin.get("note"):
+            lines.append("- 说明：%s" % md_cell(origin["note"]))
+        lines.append("- 来源：[CPRet](%s) 原题查询" % CPRET_ORIGIN)
+        lines.append("")
+    elif origin and origin.get("score") is not None:
+        lines.append("## 原题")
+        lines.append("")
+        lines.append("*未命中原题：最高相似度 %s ≤ 阈值 %s（CPRet）*" % (
+            "%.4f" % origin["score"],
+            ("%.2f" % origin["threshold"]) if isinstance(origin.get("threshold"), (int, float))
+            else "-"))
+        lines.append("")
+
     lines.append("---")
     lines.append("")
     if statement:
@@ -2961,6 +3111,374 @@ def collection_counts(problems) -> dict:
         state = problem.get("state") or STATE_TODO
         counts[state] = counts.get(state, 0) + 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# 原题查询（CPRet）
+# ---------------------------------------------------------------------------
+# 参考同一个维护者的 xinxingshe-auto-retrieve 项目改写而来：
+# 只依赖标准库（http.client 传输 + html.parser 解析结果卡片），不引入 bs4/requests。
+def vjudge_problem(source: str, url: str):
+    """把 CPRet 的一条结果映射成 VJudge 题号，返回 (oj, num, 说明)。
+
+    num 为 None 时说明无法生成题号，第三项是给用户看的原因。
+    """
+    oj = VJUDGE_SOURCES.get(str(source or "").strip())
+    if oj is None:
+        return None, None, VJUDGE_UNSUPPORTED.get(
+            source, "VJudge 题单不支持来源 %s" % (source or "未知"))
+    if oj in VJUDGE_DEAD:
+        return None, None, VJUDGE_DEAD[oj]
+    num = vjudge_problem_number(oj, url)
+    if not num:
+        return oj, None, "无法从链接识别 %s 的题号" % (source or oj)
+    return oj, num, ""
+
+
+def vjudge_problem_number(oj: str, url: str):
+    """从原站题目链接里解析 VJudge 题号（如 P1000 / 1234A / arc033_3）。"""
+    path = urllib.parse.urlsplit(str(url or "")).path.rstrip("/")
+    if oj == "CodeForces":
+        for pattern in (r"/problemset/problem/(\d+)/([A-Za-z][A-Za-z0-9]*)",
+                        r"/contest/(\d+)/problem/([A-Za-z][A-Za-z0-9]*)",
+                        r"/gym/(\d+)/problem/([A-Za-z0-9]+)"):
+            match = re.search(pattern, path)
+            if match:
+                return match.group(1) + match.group(2)
+    if oj == "Gym":
+        for pattern in (r"/gym/(\d+)/problem/([A-Za-z0-9]+)",
+                        r"/problemset/gymProblem/(\d+)/([A-Za-z0-9]+)"):
+            match = re.search(pattern, path)
+            if match:
+                return match.group(1) + match.group(2)
+    if oj == "AtCoder":
+        match = re.search(r"/contests/([^/]+)/tasks/([^/]+)", path)
+        if match:
+            return match.group(2)
+        match = re.search(r"/tasks/([^/]+)", path)
+        if match:
+            return match.group(1)
+    if oj == "洛谷":
+        match = re.search(r"/problem/([A-Za-z0-9_]+)", path)
+        return match.group(1) if match else None
+    if oj == "牛客":
+        for pattern in (r"/acm/problem/(\d+)", r"/problem/(\d+)"):
+            match = re.search(pattern, path)
+            if match:
+                return match.group(1)
+        return None
+    if oj in ("LibreOJ", "QOJ", "UniversalOJ"):
+        match = re.search(r"/problem/(\d+)", path) or re.search(r"/p/(\d+)", path)
+        return match.group(1) if match else None
+    if oj in ("SPOJ", "CodeChef", "Aizu", "Kattis"):
+        match = re.search(r"/problems?/([A-Za-z0-9_]+)", path)
+        return match.group(1) if match else None
+    if oj == "BZOJ":
+        match = re.search(r"/p/(?:bzoj-)?(?:P)?(\d+)", path) or re.search(r"id=(\d+)", url)
+        return match.group(1) if match else None
+    if oj in ("HDU", "POJ", "ZOJ", "UVA", "UVALive", "51Nod", "HihoCoder", "CSES",
+              "TopCoder", "Yukicoder", "Baekjoon"):
+        match = re.search(r"/(?:problem/|problems/|p/)([A-Za-z0-9_-]+)", path)
+        if match:
+            return match.group(1)
+        match = re.search(r"(?:problemId|id|pid)=([A-Za-z0-9_-]+)", url)
+        return match.group(1) if match else None
+    return None
+
+
+class CpretCardParser(html.parser.HTMLParser):
+    """解析 CPRet 返回的结果卡片 HTML（不依赖 bs4）。
+
+    结构（站点 2026-11 实测）：
+        <li class="result-card">
+          <a class="result-title" href="原站链接">标题</a>
+          <span class="oj-tag">Luogu</span> <span class="score-num">0.8174</span>
+          <details class="dups"> <ul><li><span class="oj-tag">..</span>
+              <a class="t" href="..">..</a> <span class="num">0.6784</span></li></ul></details>
+        </li>
+    带 ``sample-card`` 类的是"示例题"，直接跳过。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.cards = []
+        self._depth = 0
+        self._li_stack = []
+        self._dups = 0
+        self._captures = []
+        self._card_seq = 0
+        self._current_group = -1
+
+    @staticmethod
+    def _classes(attrs) -> list:
+        for key, value in attrs:
+            if key == "class" and value:
+                return value.split()
+        return []
+
+    def handle_starttag(self, tag, attrs):
+        self._depth += 1
+        classes = self._classes(attrs)
+        if tag == "li":
+            if self._dups:
+                self._li_stack.append({"kind": "dup", "data": {"group": self._current_group}})
+            elif "result-card" in classes and "sample-card" not in classes:
+                self._current_group = self._card_seq
+                self._card_seq += 1
+                self._li_stack.append({"kind": "card", "data": {
+                    "title": "", "url": "", "source": "", "score": 0.0,
+                    "duplicate": False, "group": self._current_group, "dups": []}})
+            else:
+                self._li_stack.append({"kind": "other", "data": None})
+            return
+        if tag == "details" and "dups" in classes:
+            self._dups += 1
+            return
+        if not self._li_stack or self._li_stack[-1]["data"] is None:
+            return
+        kind = None
+        if tag == "a" and ("result-title" in classes or "t" in classes):
+            kind = "title"
+        elif tag == "span" and "oj-tag" in classes:
+            kind = "source"
+        elif tag == "span" and ("score-num" in classes or "num" in classes):
+            kind = "score"
+        if kind is None:
+            return
+        self._captures.append({"tag": tag, "kind": kind, "depth": self._depth,
+                               "text": [], "href": dict(attrs).get("href") or ""})
+
+    def handle_data(self, data):
+        if self._captures:
+            self._captures[-1]["text"].append(data)
+
+    def handle_endtag(self, tag):
+        if self._captures and self._captures[-1]["tag"] == tag \
+                and self._captures[-1]["depth"] == self._depth:
+            capture = self._captures.pop()
+            self._assign(capture)
+        if tag == "details" and self._dups:
+            self._dups -= 1
+        elif tag == "li" and self._li_stack:
+            item = self._li_stack.pop()
+            if item["kind"] == "card":
+                data = item["data"]
+                if data["title"]:
+                    self.cards.append(data)
+                    # 同题/近似题排在主卡之后，保证"最高分"取的是主卡
+                    for dup in data.get("dups") or []:
+                        self.cards.append(dup)
+                self._current_group = -1
+            elif item["kind"] == "dup":
+                data = item["data"]
+                if data["title"]:
+                    data["duplicate"] = True
+                    for stack_item in self._li_stack:
+                        if stack_item["kind"] == "card":
+                            stack_item["data"].setdefault("dups", []).append(data)
+                            break
+                    else:
+                        self.cards.append(data)
+        self._depth = max(0, self._depth - 1)
+
+    def _assign(self, capture):
+        data = self._li_stack[-1]["data"] if self._li_stack else None
+        if data is None:
+            return
+        text = re.sub(r"\s+", " ", "".join(capture["text"])).strip()
+        kind = capture["kind"]
+        if kind == "title":
+            data["title"] = text
+            data["url"] = capture["href"]
+        elif kind == "source" and not data.get("source"):
+            data["source"] = text
+        elif kind == "score":
+            try:
+                score = float(text)
+            except (TypeError, ValueError):
+                score = 0.0
+            if score:
+                data["score"] = score
+            elif not data.get("score"):
+                data["score"] = data.get("score") or 0.0
+
+
+def parse_cpret_cards(html_text) -> list:
+    """把 CPRet 返回的 HTML 解析成候选列表。"""
+    if not html_text or not isinstance(html_text, str):
+        return []
+    parser = CpretCardParser()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception:            # 页面结构异常时尽量保留已解析的部分
+        pass
+    return parser.cards
+
+
+def origin_query_text(title, statement) -> str:
+    """拼接送入 CPRet 的查询文本（标题 + 题面，超长截断）。"""
+    body = (statement or "").strip()
+    head = (title or "").strip()
+    text = (head + "\n" + body) if head else body
+    return text[:ORIGIN_MAX_QUERY]
+
+
+def origin_query_id(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def match_origin(candidates, threshold, note_unsupported: bool = True) -> dict:
+    """按「最大相似度 > threshold」判定是否命中原题，返回可缓存的记录。"""
+    threshold = float(threshold)
+    prepared = []
+    for card in candidates or []:
+        card = dict(card)
+        oj, num, reason = vjudge_problem(card.get("source"), card.get("url"))
+        card["oj"], card["num"], card["unsupportedReason"] = oj, num, reason
+        card["vjudgeId"] = ("%s-%s" % (oj, num)) if (oj and num) else None
+        prepared.append(card)
+    if not prepared:
+        return {"matched": False, "threshold": threshold, "score": None,
+                "reason": "CPRet 没有返回结果", "candidates": []}
+    mains = [c for c in prepared if not c.get("duplicate")] or prepared
+    best = max(mains, key=lambda c: c.get("score") or 0.0)
+    record = {
+        "matched": bool(best.get("score") or 0.0) and best["score"] > threshold,
+        "threshold": threshold,
+        "score": round(float(best.get("score") or 0.0), 4),
+        "source": best.get("source") or "",
+        "title": best.get("title") or "",
+        "url": best.get("url") or "",
+        "oj": best.get("oj"),
+        "num": best.get("num"),
+        "vjudgeId": best.get("vjudgeId"),
+        "note": "",
+        "candidates": prepared,
+    }
+    if not record["matched"]:
+        record["bestVjudgeId"] = best.get("vjudgeId")
+        record["vjudgeId"] = None
+        record["oj"] = best.get("oj")
+        record["num"] = best.get("num")
+        return record
+    if not best.get("vjudgeId") and note_unsupported:
+        same = [c for c in prepared
+                if c.get("duplicate") and c["group"] == best["group"] and c.get("vjudgeId")]
+        if same:
+            chosen = max(same, key=lambda c: c.get("score") or 0.0)
+            record["note"] = ("最高分题目（%s）在 VJudge 不可用，"
+                              "改用同一道题的 %s 版本：%s"
+                              % (best.get("source") or "?", chosen.get("source") or "?",
+                                 chosen.get("vjudgeId")))
+            record["oj"], record["num"] = chosen["oj"], chosen["num"]
+            record["vjudgeId"] = chosen["vjudgeId"]
+            record["source"] = chosen.get("source") or record["source"]
+            record["title"] = chosen.get("title") or record["title"]
+            record["url"] = chosen.get("url") or record["url"]
+        else:
+            record["note"] = (best.get("unsupportedReason")
+                              or "已找到原题，但无法生成 VJudge 题号")
+    return record
+
+
+class CpretClient:
+    """CPRet 查询客户端（线程安全：RateLimiter 保证请求间隔）。"""
+
+    def __init__(self, api_url: str = CPRET_API, timeout: int = ORIGIN_TIMEOUT,
+                 retries: int = 2, delay: float = ORIGIN_DELAY_DEFAULT,
+                 debug: bool = False):
+        parts = urllib.parse.urlsplit(api_url)
+        self.api_url = api_url
+        self.base = "%s://%s" % (parts.scheme or "https", parts.netloc)
+        self.path = (parts.path or "/") + (("?" + parts.query) if parts.query else "")
+        self.timeout = max(5, min(int(timeout), 300))
+        self.transport = HttpTransport(self.base, timeout=self.timeout,
+                                       retries=max(0, int(retries)), debug=debug)
+        self._interval = max(0.0, float(delay))
+        self._lock = threading.Lock()
+        self._next_start = 0.0
+        self.queries = 0
+
+    def close(self) -> None:
+        self.transport.close()
+
+    def _wait(self) -> None:
+        if self._interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_start)
+            self._next_start = start + self._interval
+        delay = start - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+    def search(self, query: str) -> dict:
+        """返回 {candidates, total, elapsed}；失败抛 ApiError。"""
+        query = (query or "").strip()
+        if not query:
+            raise ApiError("查询文本为空", None, "该题没有题面，无法查询原题")
+        self._wait()
+        payload = {"q": query[:ORIGIN_MAX_QUERY], "page": 1, "count": False,
+                   "dedup": True, "mmr": False, "mode": "text"}
+        headers = {"User-Agent": ORIGIN_USER_AGENT, "Origin": CPRET_ORIGIN,
+                   "Referer": CPRET_ORIGIN + "/"}
+        status, _resp_headers, body = self.transport.request(
+            "POST", self.path, body=payload, headers=headers)
+        self.queries += 1
+        if status >= 400:
+            raise ApiError("CPRet 返回 HTTP %s" % status, status,
+                           "原题查询服务可能暂时不可用；稍后重试或加 --no-origin")
+        try:
+            data = json.loads(body)
+        except (TypeError, ValueError):
+            raise ApiError("CPRet 返回的不是合法 JSON", status,
+                           "站点可能改版；用 --debug 查看原始响应")
+        if not isinstance(data, dict):
+            raise ApiError("CPRet 返回了非预期的结构", status)
+        if data.get("error"):
+            raise ApiError("CPRet 错误：%s" % data["error"], status)
+        return {"candidates": parse_cpret_cards(data.get("html") or ""),
+                "total": safe_int(data.get("total"), 0),
+                "elapsed": data.get("elapsed")}
+
+
+def run_origin_search(store: Store, console: Console, client: CpretClient, text: str,
+                      threshold: float, refresh: bool = False,
+                      cache_days: float = ORIGIN_CACHE_DAYS):
+    """带缓存的查询：返回 (record, cached)。"""
+    query_id = origin_query_id(text)
+    cached = None if refresh else store.load_origin_cache(query_id, cache_days)
+    if cached:
+        result = match_origin(cached.get("candidates") or [], threshold)
+        result["candidates"] = (result.get("candidates") or [])[:8]
+        return result, True
+    result = client.search(text)
+    try:
+        store.save_origin_cache(query_id, {
+            "total": result.get("total"),
+            "elapsed": result.get("elapsed"),
+            "candidates": result.get("candidates") or [],
+        })
+    except StoreError:
+        pass
+    record = match_origin(result.get("candidates") or [], threshold)
+    record["candidates"] = (record.get("candidates") or [])[:8]
+    return record, False
+
+
+def compact_origin(record: dict) -> dict:
+    """存进 progress.json 的精简版本（不含完整候选列表）。"""
+    keys = ("matched", "threshold", "score", "source", "title", "url", "oj", "num",
+            "vjudgeId", "note", "reason")
+    out = {key: record.get(key) for key in keys if record.get(key) is not None}
+    out["queriedAt"] = int(time.time())
+    candidates = record.get("candidates") or []
+    out["top"] = [{"source": c.get("source"), "title": c.get("title"),
+                   "score": round(float(c.get("score") or 0.0), 4),
+                   "vjudgeId": c.get("vjudgeId")} for c in candidates[:3]]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3167,7 +3685,9 @@ def archive_one_contest(store: Store, username: str, console: Console, client: C
                         used_dirs=None, with_videos: bool = VIDEO_ENABLED_DEFAULT,
                         video_limit: int = DEFAULT_VIDEO_LIMIT,
                         download_videos: bool = False,
-                        video_max_mb: int = VIDEO_MAX_MB) -> dict:
+                        video_max_mb: int = VIDEO_MAX_MB,
+                        with_origin: bool = False,
+                        origin_threshold_value: float = ORIGIN_THRESHOLD_DEFAULT) -> dict:
     """归档一场比赛，返回统计信息（不打印，由调用方汇总）。"""
     contest_id = contest.get("id")
     detail = client.contest_detail(contest_id, problems=True,
@@ -3221,6 +3741,30 @@ def archive_one_contest(store: Store, username: str, console: Console, client: C
                     elif payload:
                         statements[str(problem.get("problemId"))] = payload
 
+    origins = {}
+    origin_errors = {}
+    if with_origin:
+        cpret = CpretClient(timeout=ORIGIN_TIMEOUT, retries=2, delay=ORIGIN_DELAY_DEFAULT,
+                            debug=False)
+        try:
+            for problem in problems:
+                pid = problem.get("problemId")
+                statement = (statements.get(str(pid)) or {}).get("statement") or ""
+                if not statement:
+                    continue
+                text = origin_query_text(problem.get("title"), statement)
+                try:
+                    record, _cached = run_origin_search(
+                        store, console, cpret, text, origin_threshold_value)
+                except ApiError as exc:
+                    origin_errors[str(pid)] = exc.message
+                    continue
+                origins[str(pid)] = compact_origin(record)
+                store.set_origin(username, contest_id, pid, origins[str(pid)])
+        finally:
+            cpret.close()
+            _safe_save_progress(store, console)
+
     files = {}
     has_statement = {}
     used_files = set()
@@ -3237,6 +3781,7 @@ def archive_one_contest(store: Store, username: str, console: Console, client: C
             "contest": entry,
             "problem": problem,
             "statement": payload.get("statement"),
+            "origin": origins.get(str(pid)) or problem.get("origin") or {},
             "error": errors.get(str(pid), ""),
             # 沿用已有文件的归档时间，重复归档时内容不变、不重写
             "archived_at": preserved_timestamp(path, force, archived_at),
@@ -3300,6 +3845,9 @@ def archive_one_contest(store: Store, username: str, console: Console, client: C
         "files_written": written,
         "files_unchanged": unchanged,
         "done": stats[STATE_DONE],
+        "origins": len(origins),
+        "origins_matched": sum(1 for o in origins.values() if o.get("matched")),
+        "origin_errors": origin_errors,
         "videos": len(video_records),
         "videos_downloaded": sum(1 for v in video_records if v.get("downloaded")),
         "video_bytes": sum(int(v.get("downloadedBytes") or 0) for v in video_records),
@@ -3648,7 +4196,8 @@ def archive_contests(store: Store, username: str, console: Console, client: Clie
                      targets, root: str, with_statements: bool = True, force: bool = False,
                      workers: int = DEFAULT_WORKERS, with_videos: bool = VIDEO_ENABLED_DEFAULT,
                      video_limit: int = DEFAULT_VIDEO_LIMIT, download_videos: bool = False,
-                     video_max_mb: int = VIDEO_MAX_MB) -> dict:
+                     video_max_mb: int = VIDEO_MAX_MB, with_origin: bool = False,
+                     origin_threshold_value: float = ORIGIN_THRESHOLD_DEFAULT) -> dict:
     """批量归档（逐场串行，内部并发抓题面），并刷新根目录 index.md。"""
     ensure_archive_root(root)
     results, failures = [], []
@@ -3665,7 +4214,9 @@ def archive_contests(store: Store, username: str, console: Console, client: Clie
                                              workers=workers, used_dirs=used_dirs,
                                              with_videos=with_videos, video_limit=video_limit,
                                              download_videos=download_videos,
-                                             video_max_mb=video_max_mb)
+                                             video_max_mb=video_max_mb,
+                                             with_origin=with_origin,
+                                             origin_threshold_value=origin_threshold_value)
                 results.append(result)
             except ApiError as exc:
                 failures.append((contest.get("id"), contest.get("name"), exc.message))
@@ -4690,6 +5241,290 @@ def cmd_export(args, store: Store, console: Console) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 命令：origin（原题查询）
+# ---------------------------------------------------------------------------
+def problem_statement_for(store: Store, client: Client, problem: dict,
+                          refresh: bool = False, ttl: int = STATEMENT_CACHE_TTL):
+    """取某道题的正文：优先本地题面缓存，缺失时联网抓并写回缓存。"""
+    pid = problem.get("problemId")
+    if pid is None:
+        return "", "题目缺少 ID"
+    cached = None if refresh else store.load_statement(pid, ttl)
+    if cached and cached.get("statement"):
+        return cached["statement"], ""
+    try:
+        data = client.problem_detail(pid, statement=True)
+    except ApiError as exc:
+        return "", exc.message
+    except Exception as exc:            # noqa: BLE001
+        return "", str(exc) or exc.__class__.__name__
+    payload = statement_cache_payload(pid, data)
+    statement = payload.get("statement") or ""
+    if not statement:
+        return "", "站点没有返回题面"
+    try:
+        store.save_statement(pid, payload)
+    except StoreError:
+        pass
+    return statement, ""
+
+
+def origin_threshold(store: Store, args=None) -> float:
+    """阈值优先级：--threshold > config.originThreshold > 0.7。"""
+    raw = getattr(args, "threshold", None) if args is not None else None
+    if raw is None:
+        raw = store.config.get("originThreshold")
+    try:
+        value = float(raw) if raw is not None else ORIGIN_THRESHOLD_DEFAULT
+    except (TypeError, ValueError):
+        value = ORIGIN_THRESHOLD_DEFAULT
+    if value < 0 or value > 1:
+        value = ORIGIN_THRESHOLD_DEFAULT
+    return value
+
+
+def origin_cli(args, store: Store, console: Console, helper) -> int:
+    """把题目送入 CPRet 查询原题；相似度 > 阈值即判为命中，并按 VJudge 题号缓存。
+
+    两个工具共用这段逻辑，差异由 helper 提供：
+        helper.pick_contest(store, username, console, spec, quiet)
+        helper.entry(store, username, contest, args)
+        helper.statement(problem, refresh)
+        helper.close()
+    """
+    if getattr(args, "offline", False):
+        console.error("已启用离线模式（--offline），原题查询需要访问 CPRet")
+        console.muted("去掉 --offline 后重试；删掉该参数即可查询")
+        return 1
+    username = store.cached_username()
+    if not username:
+        console.error("本地还没有账号数据")
+        console.muted("请先运行：%s login 然后 %s sync"
+                      % (helper.tool_name, helper.tool_name))
+        return 1
+    contest = helper.pick_contest(store, username, console, args.contest,
+                                  quiet=bool(getattr(args, "json", False)))
+    if contest is None:
+        return 1
+    threshold = origin_threshold(store, args)
+    top = max(1, min(safe_int(getattr(args, "top", 3), 3), 10))
+    workers = max(1, min(clamp_workers(getattr(args, "workers", ORIGIN_WORKERS_DEFAULT)),
+                         8))
+    refresh = bool(getattr(args, "refresh", False))
+
+    try:
+        entry = helper.entry(store, username, contest, args)
+        if entry is None:
+            return 1
+        problems = [p for p in (entry.get("problems") or []) if isinstance(p, dict)]
+        if not problems:
+            console.warn("这场比赛没有题目（讲座类比赛或站点未开放题目列表）")
+            return 0
+        if args.problems:
+            picked, missing = [], []
+            for spec in args.problems:
+                problem = resolve_problem(entry, spec)
+                if problem is None:
+                    missing.append(str(spec))
+                else:
+                    picked.append(problem)
+            problems = picked
+            if missing:
+                console.error("找不到题号：%s" % "、".join(missing))
+                console.muted("可用 `%s problems %s` 查看题号列表"
+                              % (helper.tool_name, entry.get("id")))
+                if not problems:
+                    return 1
+        problems = limit_take(problems, getattr(args, "limit", 0))
+
+        quiet = bool(getattr(args, "json", False))
+        if not quiet:
+            console.title("原题查询", note="%s · #%s" % (entry.get("name") or "",
+                                                       entry.get("id")))
+            console.kv("账号", username, value_color="bgreen")
+            console.kv("本次查询", "%d 题" % len(problems))
+            console.kv("相似度阈值", "> %.2f（--threshold 可调）" % threshold)
+            console.kv("查询服务", CPRET_API)
+            console.blank()
+
+        # 1) 取题面（并发，命中缓存则不联网）
+        fetch_console = console.stderr() if quiet else console
+        statements, statement_errors = {}, {}
+        to_fetch = [p for p in problems if p.get("problemId") is not None]
+        fetch_progress = None
+        if to_fetch and not quiet:
+            fetch_progress = Progress(fetch_console, "获取题面", total=len(to_fetch)).start_line()
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, min(workers + 2, 8))) as pool:
+                futures = {pool.submit(helper.statement, problem, refresh): problem
+                           for problem in to_fetch}
+                for index, future in enumerate(as_completed(futures), 1):
+                    problem = futures[future]
+                    try:
+                        statement, error = future.result()
+                    except Exception as exc:        # noqa: BLE001
+                        statement, error = "", str(exc)
+                    pid = problem.get("problemId")
+                    if statement:
+                        statements[str(pid)] = statement
+                    elif error:
+                        statement_errors[str(pid)] = error
+                    if fetch_progress is not None:
+                        fetch_progress.update(1, total=len(to_fetch),
+                                             detail=clean_text(problem.get("title"))[:20])
+        finally:
+            if fetch_progress is not None:
+                fetch_progress.close()
+
+        # 2) 查询 CPRet（并发 + 全局间隔）
+        cpret = CpretClient(timeout=ORIGIN_TIMEOUT, retries=2,
+                            delay=ORIGIN_DELAY_DEFAULT,
+                            debug=bool(getattr(args, "debug", False)))
+        records = {}
+        query_progress = None
+        if not quiet:
+            query_progress = Progress(fetch_console, "查询 CPRet", total=len(problems)).start_line()
+        try:
+            def query_one(problem):
+                pid = problem.get("problemId")
+                statement = statements.get(str(pid)) or ""
+                if not statement:
+                    origin = {"matched": False, "threshold": threshold, "score": None,
+                              "reason": statement_errors.get(str(pid)) or "没有题面"}
+                    return problem, origin, True
+                text = origin_query_text(problem.get("title"), statement)
+                origin, cached = run_origin_search(store, console, cpret, text, threshold,
+                                                   refresh=refresh)
+                origin["queryChars"] = len(text)
+                return problem, origin, cached
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(query_one, problem): problem for problem in problems}
+                for index, future in enumerate(as_completed(futures), 1):
+                    problem = futures[future]
+                    try:
+                        _, origin, cached = future.result()
+                    except ApiError as exc:
+                        problem, origin, cached = futures[future], {
+                            "matched": False, "threshold": threshold, "score": None,
+                            "reason": exc.message}, True
+                    except Exception as exc:            # noqa: BLE001
+                        problem, origin, cached = futures[future], {
+                            "matched": False, "threshold": threshold, "score": None,
+                            "reason": "%s: %s" % (exc.__class__.__name__, exc)}, True
+                    origin["cached"] = cached
+                    records[str(problem.get("problemId"))] = origin
+                    try:
+                        store.set_origin(username, entry.get("id"),
+                                         problem.get("problemId"), compact_origin(origin))
+                    except Exception:               # noqa: BLE001 记录失败不影响展示
+                        pass
+                    if query_progress is not None:
+                        query_progress.update(1, total=len(problems),
+                                             detail=clean_text(problem.get("title"))[:20])
+        finally:
+            if query_progress is not None:
+                query_progress.close()
+            cpret.close()
+            _safe_save_progress(store, console)
+    finally:
+        helper.close()
+
+    rows, notes, matched_count, cached_count = [], [], 0, 0
+    for problem in problems:
+        pid = str(problem.get("problemId"))
+        origin = records.get(pid) or {}
+        if origin.get("matched"):
+            matched_count += 1
+            verdict = console.paint("原题", "bgreen", bold=True)
+            target = origin.get("vjudgeId") or console.paint("无题号", "yellow")
+        else:
+            verdict = console.paint("未命中", "grey")
+            target = "-"
+        score = origin.get("score")
+        score_text = ("%.4f" % score) if isinstance(score, (int, float)) else "-"
+        note = origin.get("note") or origin.get("reason") or ""
+        if origin.get("cached"):
+            cached_count += 1
+        if note:
+            notes.append("      %s. %s：%s" % (problem.get("displayOrder"),
+                                              truncate(problem.get("title") or "", 18),
+                                              note))
+        rows.append([
+            (str(problem.get("displayOrder")), "grey"),
+            (truncate(problem.get("title") or "", 24),),
+            (score_text, "bgreen" if origin.get("matched") else "grey"),
+            (verdict,),
+            (target,),
+            (str(origin.get("source") or "-")[:14], "magenta"),
+        ])
+    if getattr(args, "json", False):
+        payload = {"contest": {"id": entry.get("id"), "name": entry.get("name")},
+                   "threshold": threshold,
+                   "cpret": CPRET_API,
+                   "problems": [{
+                       "displayOrder": problem.get("displayOrder"),
+                       "problemId": problem.get("problemId"),
+                       "title": problem.get("title"),
+                       "origin": records.get(str(problem.get("problemId"))),
+                   } for problem in problems]}
+        console.out(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        return 0
+
+    console.table(["题号", "题目", "相似度", "判定", "原题题号", "来源"], rows,
+                  aligns=["right", "left", "right", "center", "left", "left"])
+    for line in notes[:12]:
+        console.out(console.paint(line, "grey"))
+    if len(notes) > 12:
+        console.muted("（还有 %d 条备注未显示）" % (len(notes) - 12))
+    console.blank()
+    total = len(problems)
+    console.ok("命中 %d / %d 题（阈值 > %.2f）" % (matched_count, total, threshold))
+    if cached_count:
+        console.muted("其中 %d 题来自本地缓存（--refresh 可重新查询）" % cached_count)
+    if matched_count:
+        console.muted("原题题号按 VJudge 格式缓存进 progress.json，形如 洛谷-P1000 / CodeForces-1234A")
+    unmatched = [p for p in problems
+                 if not (records.get(str(p.get("problemId")) or "") or {}).get("matched")]
+    if unmatched:
+        console.muted("未命中：%s（可加 --threshold 调整判定，或用 --refresh 重新查询）"
+                      % "、".join(str(p.get("displayOrder")) for p in unmatched[:12]))
+    return 0
+
+
+class NflsojOriginHelper:
+    """nflsoj 侧的原题查询适配：比赛选择 / 题目列表 / 题面抓取。"""
+
+    tool_name = "nflsoj"
+
+    def __init__(self, store: Store, args, console: Console):
+        self.store = store
+        self.args = args
+        self.console = console
+        self.client = client_for(store, args)
+
+    def pick_contest(self, store, username, console, spec, quiet=False):
+        return _pick_contest(store, username, console, spec, quiet=quiet)
+
+    def entry(self, store, username, contest, args):
+        entry = (store.contest_entry(username, contest.get("id"))
+                 or store.upsert_contest(username, contest, None))
+        return _ensure_problems(store, username, self.console, entry, self.client,
+                                refresh=getattr(args, "refresh_problems", False))
+
+    def statement(self, problem, refresh):
+        return problem_statement_for(self.store, self.client, problem, refresh)
+
+    def close(self):
+        self.client.close()
+
+
+def cmd_origin(args, store: Store, console: Console) -> int:
+    helper = NflsojOriginHelper(store, args, console)
+    return origin_cli(args, store, console, helper)
+
+
+# ---------------------------------------------------------------------------
 # 命令：videos
 # ---------------------------------------------------------------------------
 def cmd_videos(args, store: Store, console: Console) -> int:
@@ -4870,7 +5705,9 @@ def cmd_archive(args, store: Store, console: Console) -> int:
                                  with_videos=not getattr(args, "no_videos", False),
                                  video_limit=getattr(args, "video_limit", DEFAULT_VIDEO_LIMIT),
                                  download_videos=getattr(args, "video_download", False),
-                                 video_max_mb=getattr(args, "video_max_mb", VIDEO_MAX_MB))
+                                 video_max_mb=getattr(args, "video_max_mb", VIDEO_MAX_MB),
+                                 with_origin=bool(getattr(args, "origin", False)),
+                                 origin_threshold_value=origin_threshold(store, args))
     except ApiError as exc:
         return report_error(console, exc)
     except StoreError as exc:
@@ -4893,6 +5730,8 @@ def cmd_archive(args, store: Store, console: Console) -> int:
                 "failed": item["failed"],
                 "videos": item.get("videos", 0),
                 "videosDownloaded": item.get("videos_downloaded", 0),
+                "origins": item.get("origins", 0),
+                "originsMatched": item.get("origins_matched", 0),
                 "videoBytes": item.get("video_bytes", 0),
             } for item in result["results"]],
             "failures": [{"id": cid, "name": name, "error": msg}
@@ -4911,17 +5750,29 @@ def cmd_archive(args, store: Store, console: Console) -> int:
             video_cell = str(videos) if videos else "-"
             if videos and item.get("videos_downloaded"):
                 video_cell = "%d（下载 %d）" % (videos, item["videos_downloaded"])
+            origin_cell = "-"
+            if item.get("origins"):
+                origin_cell = "%d/%d" % (item.get("origins_matched", 0), item["origins"])
             rows.append([
                 (str(item["contest"].get("id")), "grey"),
                 (item["contest"].get("name") or "",),
                 (str(item["problems"]),),
                 (str(item["statements"]), "bgreen" if item["statements"] else "grey"),
+                (origin_cell, "bgreen" if item.get("origins_matched") else "grey"),
                 (video_cell, "bcyan" if videos else "grey"),
                 (str(failed), "bred" if failed else "grey"),
                 (item["dir"], "grey"),
             ])
-        console.table(["ID", "比赛", "题目", "题面", "视频", "失败", "归档目录"], rows,
-                      aligns=["right", "left", "right", "right", "right", "right", "left"])
+        console.table(["ID", "比赛", "题目", "题面", "原题", "视频", "失败", "归档目录"], rows,
+                      aligns=["right", "left", "right", "right", "right", "right", "right",
+                              "left"])
+        origins_total = sum(int(item.get("origins") or 0) for item in result["results"])
+        origins_matched = sum(int(item.get("origins_matched") or 0)
+                              for item in result["results"])
+        if origins_total:
+            console.muted("原题查询：命中 %d / %d 题（阈值 > %.2f，结果已写入 progress.json 与题面）"
+                          % (origins_matched, origins_total,
+                             origin_threshold(store, args)))
         problems = sum(item["problems"] for item in result["results"])
         statements = sum(item["statements"] for item in result["results"])
         written = sum(item["files_written"] for item in result["results"])
@@ -5264,6 +6115,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--video-max-mb", type=arg_int_min(1), default=VIDEO_MAX_MB,
                    metavar="N", help="单个媒体文件下载上限（默认 %d MB，超过则只存元信息）"
                    % VIDEO_MAX_MB)
+    p.add_argument("--origin", action="store_true",
+                   help="归档时顺带查询原题（送入 CPRet，结果写进题面与 progress.json）")
+    p.add_argument("--threshold", type=arg_float_range(0.0, 1.0),
+                   default=ORIGIN_THRESHOLD_DEFAULT, metavar="F",
+                   help="配合 --origin 的相似度阈值（默认 %.2f）"
+                   % ORIGIN_THRESHOLD_DEFAULT)
     p.set_defaults(handler=cmd_archive, writes=True)
 
     p = sub.add_parser("videos", parents=[common], aliases=["vid"],
@@ -5283,6 +6140,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="忽略已有文件，强制重新抓取")
     p.add_argument("--json", action="store_true", help="以 JSON 输出视频元信息")
     p.set_defaults(handler=cmd_videos, writes=True)
+
+    p = sub.add_parser("origin", parents=[common], aliases=["orig", "src"],
+                       help="查询题目原题（送入 CPRet，按 VJudge 题号缓存）",
+                       description="把题目题面送入 https://cpret.online/ 做相似度检索；"
+                                   "最高相似度 > 阈值（默认 %.2f）时判为命中，"
+                                   "并记录成 VJudge 题号（形如 洛谷-P1000、CodeForces-1234A）。"
+                                   % ORIGIN_THRESHOLD_DEFAULT)
+    p.add_argument("contest", help="比赛 ID（或唯一前缀 / 名称关键词）")
+    p.add_argument("problems", nargs="*", metavar="题号",
+                   help="只查询这些题（题号或题目 ID，可多个；省略则整场）")
+    p.add_argument("--threshold", type=arg_float_range(0.0, 1.0), metavar="F",
+                   default=ORIGIN_THRESHOLD_DEFAULT,
+                   help="相似度阈值，严格大于才算命中（默认 %.2f）"
+                   % ORIGIN_THRESHOLD_DEFAULT)
+    p.add_argument("--top", type=arg_int_min(1), default=3, metavar="N",
+                   help="JSON 里保留几个候选（默认 3）")
+    p.add_argument("--limit", type=arg_int_min(0), default=0, metavar="N",
+                   help="最多查询多少题（默认 0 = 全部）")
+    p.add_argument("--workers", type=arg_int_min(1), default=ORIGIN_WORKERS_DEFAULT,
+                   metavar="N", help="并发查询数（默认 %d，内部上限 8）"
+                   % ORIGIN_WORKERS_DEFAULT)
+    p.add_argument("--refresh", action="store_true",
+                   help="忽略缓存，重新抓题面并重新查询 CPRet")
+    p.add_argument("--refresh-problems", action="store_true",
+                   help="先重新同步该比赛的题目列表")
+    p.add_argument("--json", action="store_true", help="以 JSON 输出查询结果")
+    p.set_defaults(handler=cmd_origin, writes=True)
 
     return parser
 

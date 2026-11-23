@@ -52,8 +52,10 @@
   - [`export` — 导出做题记录](#export--导出做题记录)
   - [`archive` — Markdown 归档](#archive--markdown-归档)
   - [`videos` — 讲解视频](#videos--讲解视频)
+  - [`origin` — 原题查询](#origin--原题查询)
 - [Markdown 归档详解](#markdown-归档详解)
 - [讲解视频](#讲解视频)
+- [原题查询](#原题查询)
 - [离线模式](#离线模式)
 - [性能](#性能)
 - [从 1.0 升级](#从-10-升级)
@@ -81,6 +83,9 @@
   带 YAML front matter、相对链接与原始链接。
 - **讲解视频**：从「比赛说明」里解析 `/videoshow/<uuid>` 链接，抓取标题、时长、分辨率、
   DASH 清单与 ClearKey 密钥；默认每场只取前 3 个，媒体文件按需下载并附解密助手脚本。
+- **原题查询**：把题面送进 [CPRet](https://cpret.online/) 做相似度检索，最高相似度
+  **严格大于阈值**（默认 `0.7`）时判为命中原题，并缓存成 VJudge 题号
+  （`洛谷-P1000`、`CodeForces-1234A` 这种格式）。
 - **离线模式**：`--offline` 下只读本地数据，绝不发起任何请求；`stats` / `export` 等命令
   本来就不联网，毫秒级返回。
 - **终端渲染**：256 色状态徽标、按东亚字符宽度对齐的表格、单行实时进度条（含速率与剩余时间）；
@@ -292,6 +297,7 @@ nflsoj logout     # 清除本地登录凭据（做题标记与归档文件都保
 | `export` | | 否 | 导出做题记录（md / csv / json） |
 | `archive` | `arc` | 是 | 把比赛首页与题面归档成本地 Markdown（顺带抓讲解视频元信息） |
 | `videos` | `vid` | 是 | 查看 / 保存比赛说明里的讲解视频 |
+| `origin` | `orig` / `src` | 是 | 查询原题（CPRet），按 VJudge 题号缓存 |
 
 「视情况」表示：优先使用本地缓存，只有缓存缺失或显式要求刷新时才联网。
 
@@ -633,6 +639,8 @@ nflsoj archive 2643 --video-download    # 连媒体文件一起下载（几十 M
 | `--video-limit N` | 每场最多抓几个讲解视频（默认 `3`，`0` 等同 `--no-videos`） |
 | `--video-download` | 连音视频原始文件一起下载（CENC 加密、单个数十 MB，默认关闭） |
 | `--video-max-mb N` | 单个媒体文件的下载上限（默认 `100` MB，超过则只存元信息） |
+| `--origin` | 归档时顺带查询原题（结果写进题面与 `progress.json`） |
+| `--threshold F` | 配合 `--origin` 的相似度阈值（默认 `0.70`） |
 
 不带位置参数时必须给出 `--all`、`--keyword`、`--phase`、`--limit` 之一，否则报错并提示用法。
 运行时会打印每场比赛的「ID / 比赛 / 题目 / 题面 / 失败 / 归档目录」结果表，
@@ -682,6 +690,59 @@ nflsoj videos 2647 --json               # 以 JSON 输出（stdout 只有 JSON�
 
 `archive` 默认也会为每场比赛顺带抓前 3 个视频的元信息（表格里多一列「视频」），
 用 `--no-videos` 关掉。
+
+---
+
+### `origin` — 原题查询
+
+把题目题面送进 [CPRet](https://cpret.online/) 做相似度检索：**最高相似度严格大于阈值**
+（默认 `0.70`）即判为命中原题，否则视为「无原题」，并保留最高相似度供人工复核。
+
+命中的原题按 **VJudge 题号**缓存（`洛谷-P1000`、`CodeForces-1234A`、`AtCoder-abc154_e`
+这种 `OJ-题号` 形式），写进 `progress.json` 的题目记录里，重复查询直接命中缓存。
+
+```bash
+nflsoj origin 2647                     # 整场 7 题
+nflsoj origin 2647 1 3                 # 只查第 1、3 题（也可用题目 ID）
+nflsoj origin 2647 --threshold 0.85    # 提高判定门槛
+nflsoj origin 2647 --refresh           # 忽略缓存，重新抓题面并重查
+nflsoj origin 2647 --limit 3           # 只查前 3 题（试水）
+nflsoj origin 2647 --json              # 纯 JSON 输出（含候选与相似度）
+nflsoj archive 2647 --origin           # 归档时顺带查，结果写进题面 Markdown
+```
+
+| 参数 / 选项 | 说明 |
+|---|---|
+| `SPEC`（位置参数） | 比赛 ID（或唯一前缀 / 名称关键词） |
+| `题号 ...` | 只查询这些题（题号或题目 ID，可多个；省略则整场） |
+| `--threshold F` | 相似度阈值，**严格大于**才算命中（默认 `0.70`） |
+| `--top N` | JSON 里保留几个候选（默认 `3`） |
+| `--limit N` | 最多查询多少题（默认 `0` = 全部） |
+| `--workers N` | 并发查询数（默认 `2`，内部上限 8；服务端有限流，别开太大） |
+| `--refresh` | 忽略缓存，重新抓题面并重新查询 |
+| `--refresh-problems` | 先重新同步该比赛的题目列表 |
+| `--json` | 以 JSON 输出（stdout 只有 JSON） |
+
+输出示例（NFLSOJ 比赛 2647 实测，阈值 0.70）：
+
+```text
+┌──────┬───────────────┬────────┬──────┬──────────────────┬────────────┐
+│ 题号 │ 题目          │ 相似度 │ 判定 │ 原题题号         │ 来源       │
+├──────┼───────────────┼────────┼──────┼──────────────────┼────────────┤
+│    1 │ 非零数位      │ 0.8847 │ 原题 │ AtCoder-abc154_e │ AtCoder    │
+│    2 │ A类B类数      │ 0.8979 │ 原题 │ 洛谷-B2140       │ Luogu      │
+│    3 │ 奶牛的叫唤2.0 │ 0.9120 │ 原题 │ QOJ-21095        │ QOJ        │
+│    4 │ 除九的余数    │ 0.7141 │ 原题 │ QOJ-12975        │ QOJ        │
+│    5 │ 数位LIS       │ 0.7307 │ 原题 │ 无题号           │ BZOJ       │
+│    6 │ 排序数        │ 0.9223 │ 原题 │ CodeForces-908G  │ Codeforces │
+│    7 │ tickets       │ 0.8435 │ 原题 │ 无题号           │ BZOJ       │
+└──────┴───────────────┴────────┴──────┴──────────────────┴────────────┘
+      3. 奶牛的叫唤2.0：最高分题目（BZOJ）在 VJudge 不可用，改用同一道题的 QOJ 版本：QOJ-21095
+      5. 数位LIS：VJudge 的 BZOJ 已停止服务
+```
+
+阈值提高到 `0.95` 时同样几题都会变成「未命中」——判定是**严格大于**，
+所以 `0.9223 > 0.95` 不成立。想把这些也算原题，把阈值调到 `0.9` 即可。
 
 ---
 
@@ -942,6 +1003,84 @@ ffmpeg -y -decryption_key <keyHex> -i "01-x.video.mp4" \
 
 ---
 
+## 原题查询
+
+`origin` 把题面送进 **CPRet**（<https://cpret.online/>，一个按文本相似度的 OI 题库检索服务），
+用最高相似度判定这道题是不是「别的 OJ 上已有的题」。
+
+### 判定规则
+
+| 情况 | 判定 |
+|---|---|
+| 最高相似度 **> threshold**（默认 `0.70`） | 命中原题，取相似度最高的那条 |
+| 最高相似度 **≤ threshold** | 视为「无原题」，但保留最高相似度供人工复核 |
+
+注意是**严格大于**：`0.7000` 不算命中，`0.7001` 才算。
+
+`threshold` 的取值顺序：`--threshold` > `config.json` 的 `originThreshold` > 默认 `0.7`。
+
+### 缓存格式（VJudge 题号）
+
+命中的原题统一缓存成 **VJudge 题号**，即 `<OJ键>-<题号>`：
+
+| CPRet 来源 | VJudge 题号示例 | 说明 |
+|---|---|---|
+| Luogu | `洛谷-P1000` | 洛谷在 VJudge 的键是中文「洛谷」 |
+| Codeforces | `CodeForces-1234A` | 注意大写 F |
+| AtCoder | `AtCoder-abc154_e` | 直接取 task 名 |
+| Nowcoder | `牛客-51117` | |
+| UOJ | `UniversalOJ-21` | |
+| QOJ / LibreOJ / SPOJ / Kattis … | `QOJ-18512` / `LibreOJ-104` | |
+
+缓存写进 `progress.json`，每题一条：
+
+```jsonc
+{
+  "problemId": 15276,
+  "title": "非零数位",
+  "origin": {
+    "matched": true,
+    "score": 0.8847,
+    "threshold": 0.7,
+    "vjudgeId": "AtCoder-abc154_e",
+    "source": "AtCoder",
+    "title": "[ABC154E] Almost Everywhere Zero",
+    "url": "https://atcoder.jp/contests/abc154/tasks/abc154_e",
+    "queriedAt": 1795435000,
+    "top": [{"source": "AtCoder", "score": 0.8847, "vjudgeId": "AtCoder-abc154_e"}, ...]
+  }
+}
+```
+
+VJudge 不支持或已停服的来源（`BZOJ`、`Hydro`、`LeetCode` 等）仍会判为命中，
+但题号记为「无题号」并在备注里说明原因；若同一道题在别的 OJ 上有可映射的版本
+（CPRet 的「合并重复题」分组），会自动改用那个版本并注明。
+
+### 两级缓存
+
+1. **CPRet 结果缓存**：`<数据目录>/cache/cpret/<题面哈希>.json`，有效期 14 天。
+   同一份题面重复查询不再访问网络；换阈值只是本地重算，不重新搜索。
+2. **每题判定缓存**：`progress.json` 里的 `origin` 字段，随 `sync` 一起保留。
+
+`--refresh` 同时跳过这两级缓存（重新抓题面 + 重新查询）。
+
+### 性能
+
+| 阶段 | 实测 |
+|---|---|
+| 单题查询（CPRet） | 0.6 ~ 1.2 秒（服务端 20 万+ 题库里检索） |
+| 整场 7 题（2 并发） | 3 ~ 4 秒（含题面抓取） |
+| 全部命中缓存 | < 0.2 秒 |
+
+服务端有 QPS 限制，默认 `--workers 2` + 每次请求间隔 0.4 秒；开太大只会变慢。
+
+### Hydro 版
+
+`hydrooj` 也有同样的 `origin` 命令（短 ID 形态，例如 `hydrooj origin 6a323c90`），
+题面来自 Hydro 的 `pdoc.content`，其余行为完全一致。
+
+---
+
 ## 离线模式
 
 `--offline` 表示「只用本地数据」：任何需要访问站点的操作都会立刻失败，而不是静默联网。
@@ -1022,6 +1161,18 @@ nflsoj --offline export -o 记录.md
 ---
 
 ## 从 1.0 升级
+
+### 2.0 → 2.1
+
+2.1.0 新增**原题查询**（两个工具都有）：
+
+| 变更 | 1.3 | 1.4 |
+|---|---|---|
+| 原题查询 | 无 | 新增 `origin` 命令（别名 `orig` / `src`）：送入 CPRet 查相似度，严格大于阈值即命中 |
+| 判定缓存 | 无 | 命中结果按 VJudge 题号（`洛谷-P1000`、`CodeForces-1234A`）写进 `progress.json` |
+| 结果缓存 | 无 | 题面哈希为键的结果缓存（14 天），换阈值不必联网 |
+| 归档 | 只有题面 | `archive --origin` 把「## 原题」区块写进题目 Markdown 与 front matter |
+| 命令 | `nflsoj` / `hydrooj` 各 12 个 | 各 13 个（新增 `origin`） |
 
 ### 1.2 → 1.3
 
@@ -1136,8 +1287,9 @@ nflsoj archive --all         # 首次建立本地 Markdown 存档
 ├── config.json          # 站点地址与登录凭据
 ├── progress.json        # 账号 → 比赛 → 题目 的缓存与做题标记
 ├── cache/
-│   └── statements/      # 题面缓存 <题目ID>.json，30 天有效
-│       └── 31766.json
+│   ├── statements/      # 题面缓存 <题目ID>.json，30 天有效
+│   │   └── 31766.json
+│   └── cpret/           # 原题查询结果缓存（题面哈希为键），14 天有效
 └── archive/             # archive 命令的默认输出目录
     ├── index.md
     └── 2643-S+线段树/…
@@ -1233,10 +1385,14 @@ nflsoj archive --all         # 首次建立本地 Markdown 存档
 | `GET` | `/api/contest/getContest` | `contestId`, `description`, `problemInfos`, `announcements` | `{meta, problemInfos, description, announcements, permissions, ...}` |
 | `GET` | `/api/problem/getProblem` | `id`, `statement` | `{meta: {id, title}, statement, statistics, ...}` |
 | `GET` | `/api/video/getVideo` | `displayUuid`（注意不是 `videoId`） | `{displayName, status, transcodeProgress, mpdUrl, videoUrl, audioUrl, keyHex, keyIdHex}` |
+| `POST` | `https://cpret.online/api/search` | body `{q, page:1, count:false, dedup:true, mmr:false, mode:"text"}` | `{html, total, elapsed}`，结果卡片在 `html` 里 |
 
 视频接口返回的 `mpdUrl` / `videoUrl` / `audioUrl` 是 **MinIO 的签名直链**（有效期约 20 小时），
 与站点不同源，工具会为它们单独建连接且**不发送站点凭据**；`keyHex` 是 ClearKey 解密密钥。
 媒体文件是 CENC 加密的 DASH 分轨，播放前需要解密 + 合并（详见「讲解视频」一章）。
+
+> CPRet 是**第三方服务**（不是本站点）：`origin` 会把题面文本发过去。
+> 若不想外发，别用 `origin` / `archive --origin` 即可，其它命令不受影响。
 
 要点：
 

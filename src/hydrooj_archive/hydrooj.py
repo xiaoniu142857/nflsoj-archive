@@ -44,7 +44,7 @@ except ImportError:                     # 直接 python src/hydrooj_archive/hydr
     sys.path.insert(0, os.path.dirname(_HERE))
     from nflsoj_archive import nflsoj as core
 
-__version__ = "1.3.0"
+__version__ = "2.1.0"
 
 DEFAULT_API = "http://nflsoi.cc:10611"
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".hydrooj")
@@ -913,7 +913,8 @@ def _contest_bundle(meta: dict, problems, detail: dict, files, has_statement,
 def archive_one_contest(store: Store, username: str, console: Console, client: HydroClient,
                         contest: dict, root: str, with_statements: bool = True,
                         force: bool = False, workers: int = DEFAULT_WORKERS,
-                        used_dirs=None) -> dict:
+                        used_dirs=None, with_origin: bool = False,
+                        origin_threshold_value: float = core.ORIGIN_THRESHOLD_DEFAULT) -> dict:
     """归档一场比赛：比赛首页 + 每题一份题面。"""
     _ensure_base(store)
     cid = str(contest.get("id"))
@@ -964,6 +965,31 @@ def archive_one_contest(store: Store, username: str, console: Console, client: H
                 elif record:
                     statements[key] = record
 
+    origins = {}
+    if with_origin:
+        cpret = core.CpretClient(timeout=core.ORIGIN_TIMEOUT, retries=2,
+                                 delay=core.ORIGIN_DELAY_DEFAULT, debug=False)
+        try:
+            for problem in problems:
+                pid = problem.get("problemId")
+                statement_text = (statements.get(str(pid)) or {}).get("statement") or ""
+                if not statement_text:
+                    continue
+                text = core.origin_query_text(problem.get("title"), statement_text)
+                try:
+                    record, _cached = core.run_origin_search(
+                        store, console, cpret, text, origin_threshold_value)
+                except ApiError:
+                    continue
+                origins[str(pid)] = core.compact_origin(record)
+                try:
+                    store.set_origin(username, cid, pid, origins[str(pid)])
+                except Exception:           # noqa: BLE001
+                    pass
+        finally:
+            cpret.close()
+            _safe_save_progress(store, console)
+
     files, has_statement, used_files = {}, {}, set()
     written = unchanged = 0
     for problem in problems:
@@ -971,7 +997,8 @@ def archive_one_contest(store: Store, username: str, console: Console, client: H
         order = str(problem.get("displayOrder"))
         files[order] = "problems/" + filename
         pid = problem.get("problemId")
-        record = statements.get(str(pid)) or {}
+        record = dict(statements.get(str(pid)) or {})
+        record["origin"] = origins.get(str(pid)) or problem.get("origin") or {}
         has_statement[order] = bool(record.get("statement"))
         path = os.path.join(problems_dir, filename)
         content = core.render_problem_markdown({
@@ -1017,6 +1044,8 @@ def archive_one_contest(store: Store, username: str, console: Console, client: H
         "path": contest_dir,
         "problems": len(problems),
         "statements": statement_total,
+        "origins": len(origins),
+        "origins_matched": sum(1 for o in origins.values() if o.get("matched")),
         "failed": errors,
         "files_written": written,
         "files_unchanged": unchanged,
@@ -1026,7 +1055,8 @@ def archive_one_contest(store: Store, username: str, console: Console, client: H
 
 def archive_contests(store: Store, username: str, console: Console, client: HydroClient,
                      targets, root: str, with_statements: bool = True, force: bool = False,
-                     workers: int = DEFAULT_WORKERS) -> dict:
+                     workers: int = DEFAULT_WORKERS, with_origin: bool = False,
+                     origin_threshold_value: float = core.ORIGIN_THRESHOLD_DEFAULT) -> dict:
     _ensure_base(store)
     os.makedirs(root, exist_ok=True)
     results, failures = [], []
@@ -1041,7 +1071,8 @@ def archive_contests(store: Store, username: str, console: Console, client: Hydr
                 results.append(archive_one_contest(
                     store, username, console, client, contest, root,
                     with_statements=with_statements, force=force, workers=workers,
-                    used_dirs=used_dirs))
+                    used_dirs=used_dirs, with_origin=with_origin,
+                    origin_threshold_value=origin_threshold_value))
             except ApiError as exc:
                 failures.append((short_id(contest.get("id")), contest.get("name"), exc.message))
             except Exception as exc:            # noqa: BLE001
@@ -1844,6 +1875,70 @@ def cmd_export(args, store: Store, console: Console) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 命令：origin（原题查询）
+# ---------------------------------------------------------------------------
+def problem_statement_for(store: Store, client: HydroClient, problem: dict, contest_id,
+                          refresh: bool = False) -> tuple:
+    """取 Hydro 题面：优先本地缓存，缺失时抓 /p/<id> 并写回缓存。"""
+    pid = problem.get("problemId")
+    if pid is None:
+        return "", "题目缺少 ID"
+    cached = None if refresh else store.load_statement(pid, STATEMENT_CACHE_TTL)
+    if cached and cached.get("statement"):
+        return cached["statement"], ""
+    try:
+        data = client.problem(pid, contest_id)
+    except ApiError as exc:
+        return "", exc.message
+    except Exception as exc:            # noqa: BLE001
+        return "", str(exc) or exc.__class__.__name__
+    statement = problem_statement(data)
+    if not statement:
+        return "", "站点没有返回题面（可能需要报名或权限）"
+    record = statement_payload(problem, data)
+    try:
+        store.save_statement(pid, record)
+    except StoreError:
+        pass
+    return statement, ""
+
+
+class HydroOriginHelper:
+    """hydrooj 侧的原题查询适配：比赛选择 / 题目列表 / 题面抓取。"""
+
+    tool_name = "hydrooj"
+
+    def __init__(self, store: Store, args, console: Console):
+        self.store = store
+        self.args = args
+        self.console = console
+        self.client = client_for(store, args)
+
+    def pick_contest(self, store, username, console, spec, quiet=False):
+        return _pick_contest(store, username, console, spec)
+
+    def entry(self, store, username, contest, args):
+        cid = contest.get("id")
+        self.contest_id = cid
+        entry = (store.contest_entry(username, cid)
+                 or store.upsert_contest(username, contest, None))
+        return _ensure_problems(store, username, self.console, entry, self.client,
+                                refresh=getattr(args, "refresh_problems", False))
+
+    def statement(self, problem, refresh):
+        return problem_statement_for(self.store, self.client, problem,
+                                     getattr(self, "contest_id", None), refresh)
+
+    def close(self):
+        self.client.close()
+
+
+def cmd_origin(args, store: Store, console: Console) -> int:
+    helper = HydroOriginHelper(store, args, console)
+    return core.origin_cli(args, store, console, helper)
+
+
+# ---------------------------------------------------------------------------
 # 命令：archive
 # ---------------------------------------------------------------------------
 def cmd_archive(args, store: Store, console: Console) -> int:
@@ -1898,7 +1993,9 @@ def cmd_archive(args, store: Store, console: Console) -> int:
     try:
         result = archive_contests(store, username, console, client, targets, root,
                                  with_statements=document, force=args.force,
-                                 workers=args.workers)
+                                 workers=args.workers,
+                                 with_origin=bool(getattr(args, "origin", False)),
+                                 origin_threshold_value=core.origin_threshold(store, args))
     except ApiError as exc:
         return core.report_error(console, exc)
     except StoreError as exc:
@@ -1932,16 +2029,21 @@ def cmd_archive(args, store: Store, console: Console) -> int:
         rows = []
         for item in result["results"]:
             failed = len(item["failed"])
+            origin_cell = "-"
+            if item.get("origins"):
+                origin_cell = "%d/%d" % (item.get("origins_matched", 0), item["origins"])
             rows.append([
                 (short_id(item["contest"].get("id")), "grey"),
                 (item["contest"].get("name") or "",),
                 (str(item["problems"]),),
                 (str(item["statements"]), "bgreen" if item["statements"] else "grey"),
+                (origin_cell, "bgreen" if item.get("origins_matched") else "grey"),
                 (str(failed), "bred" if failed else "grey"),
                 (item["dir"], "grey"),
             ])
-        console.table(["短 ID", "比赛", "题目", "题面", "失败", "归档目录"], rows,
-                      aligns=["right", "left", "right", "right", "right", "left"])
+        console.table(["短 ID", "比赛", "题目", "题面", "原题", "失败", "归档目录"], rows,
+                      aligns=["right", "left", "right", "right", "right", "right",
+                              "left"])
         problems = sum(item["problems"] for item in result["results"])
         statements = sum(item["statements"] for item in result["results"])
         written = sum(item["files_written"] for item in result["results"])
@@ -2252,6 +2354,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--phase", choices=["not_started", "running", "ended", "unknown"], help="按状态过滤")
     p.set_defaults(handler=cmd_export)
 
+    p = sub.add_parser("origin", parents=[common], aliases=["orig", "src"],
+                       help="查询题目原题（送入 CPRet，按 VJudge 题号缓存）",
+                       description="把题目正文送入 https://cpret.online/ 做相似度检索；"
+                                   "最高相似度 > 阈值（默认 %.2f）时判为命中，"
+                                   "并记录成 VJudge 题号（形如 洛谷-P1000、CodeForces-1234A）。"
+                                   % core.ORIGIN_THRESHOLD_DEFAULT)
+    p.add_argument("contest", help="比赛 ID（短 ID / 唯一前缀 / 名称关键词）")
+    p.add_argument("problems", nargs="*", metavar="题号",
+                   help="只查询这些题（题号或题目 ID，可多个；省略则整场）")
+    p.add_argument("--threshold", type=core.arg_float_range(0.0, 1.0), metavar="F",
+                   default=core.ORIGIN_THRESHOLD_DEFAULT,
+                   help="相似度阈值，严格大于才算命中（默认 %.2f）"
+                   % core.ORIGIN_THRESHOLD_DEFAULT)
+    p.add_argument("--top", type=core.arg_int_min(1), default=3, metavar="N",
+                   help="JSON 里保留几个候选（默认 3）")
+    p.add_argument("--limit", type=core.arg_int_min(0), default=0, metavar="N",
+                   help="最多查询多少题（默认 0 = 全部）")
+    p.add_argument("--workers", type=core.arg_int_min(1),
+                   default=core.ORIGIN_WORKERS_DEFAULT, metavar="N",
+                   help="并发查询数（默认 %d，内部上限 8）"
+                   % core.ORIGIN_WORKERS_DEFAULT)
+    p.add_argument("--refresh", action="store_true",
+                   help="忽略缓存，重新抓题面并重新查询 CPRet")
+    p.add_argument("--refresh-problems", action="store_true",
+                   help="先重新同步该比赛的题目列表")
+    p.add_argument("--json", action="store_true", help="以 JSON 输出查询结果")
+    p.set_defaults(handler=cmd_origin, writes=True)
+
     p = sub.add_parser("archive", parents=[common], aliases=["arc"],
                        help="把比赛首页与题面归档成本地 Markdown",
                        description="把比赛首页（说明 / 题目列表）与每道题的题面保存为本地 "
@@ -2264,6 +2394,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="最多归档多少场比赛（0 = 不限制）")
     p.add_argument("--dir", metavar="DIR", help="归档目录（默认 %s）" % "<数据目录>/archive")
     p.add_argument("--no-statements", action="store_true", help="只存比赛首页，不抓题目正文")
+    p.add_argument("--origin", action="store_true",
+                   help="归档时顺带查询原题（送入 CPRet，结果写进题面与 progress.json）")
+    p.add_argument("--threshold", type=core.arg_float_range(0.0, 1.0),
+                   default=core.ORIGIN_THRESHOLD_DEFAULT, metavar="F",
+                   help="配合 --origin 的相似度阈值（默认 %.2f）"
+                   % core.ORIGIN_THRESHOLD_DEFAULT)
     p.add_argument("--force", action="store_true", help="忽略本地题面缓存，强制重新抓取")
     p.add_argument("--workers", type=arg_int_min(1),
                    default=DEFAULT_WORKERS, metavar="N",
