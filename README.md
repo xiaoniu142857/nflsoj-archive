@@ -655,24 +655,33 @@ nflsoj archive 2643 --video-download    # 连媒体文件一起下载（几十 M
 `videos` 解析这些链接并查询视频元信息；为了避免一次拉全站，**默认只看前 3 个**。
 
 ```bash
-nflsoj videos 2647                      # 看这场比赛说明里的视频（默认前 3 个）
-nflsoj videos 2647 --limit 1            # 只看第 1 个
+nflsoj videos 2647                      # 列出这场比赛说明里的全部视频
 nflsoj videos 2647 --save               # 存元信息 + DASH 清单到归档目录
-nflsoj videos 2647 --save --download    # 连媒体文件一起下载（体积很大）
-nflsoj videos 2647 --save --download --max-mb 40   # 只下载小于 40MB 的文件
+nflsoj videos 2647 --download           # 保存并下载媒体（隐含 --save）
+nflsoj videos 2647 --download --max-mb 40   # 只下载小于 40MB 的文件
+nflsoj videos --all                     # 查看本地全部比赛的视频
+nflsoj videos --all --save              # 全部保存元信息（一次性）
+nflsoj videos --all --download          # 一次性下载全部视频
+nflsoj videos --all --download --max-mb 200 --keyword 数位   # 只处理匹配的比赛
 nflsoj videos 2647 --json               # 以 JSON 输出（stdout 只有 JSON）
 ```
 
 | 参数 / 选项 | 说明 |
 |---|---|
-| `SPEC`（位置参数） | 比赛 ID（或唯一前缀 / 名称关键词） |
-| `--limit N` | 最多查询几个视频（默认 `3`，上限 50） |
+| `SPEC`（位置参数） | 比赛 ID（或唯一前缀 / 名称关键词）；用 `--all` 时省略 |
+| `--all` | 一次性处理本地**全部已同步比赛**的视频（配合 `--download` 即"下载全部"） |
+| `--keyword TEXT` | 配合 `--all`：只处理名称含该关键词的比赛 |
+| `--phase {...}` | 配合 `--all`：只处理该状态的比赛 |
+| `--limit N` | 每场最多处理几个视频（默认 `0` = 全部） |
 | `--save` | 把元信息（JSON）与 DASH 清单（`.mpd`）保存到 `<归档目录>/<比赛>/videos/` |
-| `--download` | 配合 `--save`，额外下载音视频原始文件 |
-| `--max-mb N` | 单个媒体文件下载上限（默认 `100` MB） |
-| `--dir DIR` | 配合 `--save` 的归档目录（默认 `<数据目录>/archive`） |
-| `--force` | 强制重新抓取（默认已存在的文件内容不变时不重写） |
+| `--download` | 保存并下载音视频原始文件（隐含 `--save`） |
+| `--max-mb N` | 单个媒体文件下载上限（默认 `100` MB，超过跳过并记录原因） |
+| `--dir DIR` | 归档目录（默认 `<数据目录>/archive`） |
+| `--refresh` / `--force` | 强制重新抓取（默认内容未变时不重写） |
 | `--json` | 以 JSON 输出视频元信息 |
+
+批量模式最后会汇总「处理了多少场 / 多少个视频 / 实际下载了多少个（总大小）」，
+下载被上限挡掉时会给出「N 个文件超过 --max-mb=X」的提示。
 
 输出示例：
 
@@ -704,9 +713,11 @@ nflsoj videos 2647 --json               # 以 JSON 输出（stdout 只有 JSON�
 ```bash
 nflsoj origin 2647                     # 整场 7 题
 nflsoj origin 2647 1 3                 # 只查第 1、3 题（也可用题目 ID）
+nflsoj origin --all                    # 一次性查询本地全部题目并缓存题号（已缓存的跳过）
+nflsoj origin --all --keyword 数位      # 只查名称匹配的比赛
+nflsoj origin --all --refresh          # 全部重查（忽略缓存）
+nflsoj origin --all --limit 50         # 本次最多查 50 题（分批跑）
 nflsoj origin 2647 --threshold 0.85    # 提高判定门槛
-nflsoj origin 2647 --refresh           # 忽略缓存，重新抓题面并重查
-nflsoj origin 2647 --limit 3           # 只查前 3 题（试水）
 nflsoj origin 2647 --json              # 纯 JSON 输出（含候选与相似度）
 nflsoj archive 2647 --origin           # 归档时顺带查，结果写进题面 Markdown
 ```
@@ -716,11 +727,12 @@ nflsoj archive 2647 --origin           # 归档时顺带查，结果写进题面
 | `SPEC`（位置参数） | 比赛 ID（或唯一前缀 / 名称关键词） |
 | `题号 ...` | 只查询这些题（题号或题目 ID，可多个；省略则整场） |
 | `--threshold F` | 相似度阈值，**严格大于**才算命中（默认 `0.70`） |
-| `--top N` | JSON 里保留几个候选（默认 `3`） |
-| `--limit N` | 最多查询多少题（默认 `0` = 全部） |
-| `--workers N` | 并发查询数（默认 `2`，内部上限 8；服务端有限流，别开太大） |
+| `--all` | 一次性查询本地**全部已同步比赛**的题目；已有结果的题默认跳过（增量） |
+| `--keyword TEXT` | 配合 `--all`：只查名称含该关键词的比赛 |
+| `--phase {...}` | 配合 `--all`：只查该状态的比赛 |
+| `--limit N` | 本次最多查询多少题（默认 `0` = 全部，可分批跑） |
+| `--workers N` | 并发查询数（默认 `2`，内部上限 8；服务端有限流，开太大只会更慢） |
 | `--refresh` | 忽略缓存，重新抓题面并重新查询 |
-| `--refresh-problems` | 先重新同步该比赛的题目列表 |
 | `--json` | 以 JSON 输出（stdout 只有 JSON） |
 
 输出示例（NFLSOJ 比赛 2647 实测，阈值 0.70）：
@@ -960,6 +972,28 @@ JSON 里除了 URL，还有 **`keyHex`**——这是把视频变成可播放文�
 签名直链约 20 小时后失效，但 `keyHex` 与 `.mpd` 长期有效，
 失效后重新跑一次 `nflsoj videos <id> --save` 即可换取新地址。
 
+### 一次性下载全部视频
+
+```bash
+nflsoj videos --all --download                    # 全部比赛、全部视频
+nflsoj videos --all --download --max-mb 200       # 只下载小于 200MB 的文件
+nflsoj videos --all --save                        # 只存元信息（秒级）
+nflsoj videos --all --keyword 数位 --download      # 只处理匹配的比赛
+nflsoj videos 2647 --download                     # 单场（--download 隐含 --save）
+```
+
+批量模式会逐场处理、显示"处理比赛"进度，最后汇总：
+
+```text
+  ✔ 已处理 20 场比赛、20 个视频到 ~/.nflsoj/archive
+      已下载 20 个媒体文件（共 1.9 GB）
+      解密：进入各比赛的 videos/ 目录运行 decrypt.ps1（需要 ffmpeg）
+```
+
+被 `--max-mb` 挡掉的文件不会静默失败——结尾会提示「N 个文件超过 --max-mb=X 已跳过」，
+每个视频的 JSON 里也记录了 `downloadErrors`。**建议先用 `--max-mb` 卡一个上限试跑**，
+确认网络与磁盘后去掉上限再全量下载。
+
 ### 让下载到的视频可播放（需要 ffmpeg）
 
 本项目**零依赖、不内置解密**（纯 Python 做 CENC 解密 + mp4 重封装不现实）。
@@ -1074,10 +1108,30 @@ VJudge 不支持或已停服的来源（`BZOJ`、`Hydro`、`LeetCode` 等）仍�
 
 服务端有 QPS 限制，默认 `--workers 2` + 每次请求间隔 0.4 秒；开太大只会变慢。
 
+### 批量：一次性查完全部题目
+
+`origin --all` 会把本地所有已同步比赛的题目跑一遍，并把命中的题号写进 `progress.json`：
+
+```bash
+nflsoj origin --all                 # 首次：全部题目查一遍（可分批，见 --limit）
+nflsoj origin --all --limit 50      # 每次最多 50 题，跑几轮即可覆盖全部
+nflsoj origin --all --refresh       # 已有结果也重查
+nflsoj origin --all --keyword 数位   # 只查匹配的比赛
+nflsoj origin --all --json          # 机器可读的完整结果
+```
+
+批量模式的特点：
+
+- **增量**：已有 `score` 结果（也就是真的查过）的题默认跳过，第二次跑只补新题；
+- **拿不到题面的题不缓存**（未开始 / 无权限的题会在下次运行时自动重试），
+  结尾会提示「其中 N 题拿不到题面」；
+- 进度条分两段：获取题面 / 查询 CPRet；每 20 题落盘一次，中断后可继续；
+- 结尾汇总「查询 N 题、命中 M 题、跳过 K 题、用时 X」。
+
 ### Hydro 版
 
-`hydrooj` 也有同样的 `origin` 命令（短 ID 形态，例如 `hydrooj origin 6a323c90`），
-题面来自 Hydro 的 `pdoc.content`，其余行为完全一致。
+`hydrooj` 也有同样的 `origin` 命令（短 ID 形态，例如 `hydrooj origin 6a323c90`，
+批量用 `hydrooj origin --all`），题面来自 Hydro 的 `pdoc.content`，其余行为完全一致。
 
 ---
 
@@ -1161,6 +1215,19 @@ nflsoj --offline export -o 记录.md
 ---
 
 ## 从 1.0 升级
+
+### 2.1 → 2.2
+
+2.2.0 把「批量」做成一等公民，并精简了一批参数：
+
+| 变更 | 2.1 | 2.2 |
+|---|---|---|
+| 原题查询 | 只能按单场比赛查 | 新增 `origin --all`：一次性查完全部题目并缓存题号（增量、可分批） |
+| 讲解视频 | 只能按单场处理，默认前 3 个 | 新增 `videos --all`：一次性处理/下载全部视频；单场默认全部 |
+| `videos --download` | 必须配合 `--save` | `--download` 隐含保存，少打一个参数 |
+| `origin` 参数 | `--top`、`--refresh-problems` | 已移除（候选数固定、题目列表缓存自动维护） |
+| `videos` 的 `--force` | 单独存在 | 统一为 `--refresh`（`--force` 仍可用） |
+| 失败重试 | 拿不到题面也会写入缓存 | 只有真正查过（有相似度）的题才缓存，无题面的题下次自动重试 |
 
 ### 2.0 → 2.1
 

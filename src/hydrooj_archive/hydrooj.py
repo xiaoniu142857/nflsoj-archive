@@ -44,7 +44,7 @@ except ImportError:                     # 直接 python src/hydrooj_archive/hydr
     sys.path.insert(0, os.path.dirname(_HERE))
     from nflsoj_archive import nflsoj as core
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 DEFAULT_API = "http://nflsoi.cc:10611"
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".hydrooj")
@@ -2360,25 +2360,26 @@ def build_parser() -> argparse.ArgumentParser:
                                    "最高相似度 > 阈值（默认 %.2f）时判为命中，"
                                    "并记录成 VJudge 题号（形如 洛谷-P1000、CodeForces-1234A）。"
                                    % core.ORIGIN_THRESHOLD_DEFAULT)
-    p.add_argument("contest", help="比赛 ID（短 ID / 唯一前缀 / 名称关键词）")
+    p.add_argument("contest", nargs="?", help="比赛 ID（短 ID / 唯一前缀 / 名称关键词；--all 时省略）")
     p.add_argument("problems", nargs="*", metavar="题号",
                    help="只查询这些题（题号或题目 ID，可多个；省略则整场）")
     p.add_argument("--threshold", type=core.arg_float_range(0.0, 1.0), metavar="F",
                    default=core.ORIGIN_THRESHOLD_DEFAULT,
                    help="相似度阈值，严格大于才算命中（默认 %.2f）"
                    % core.ORIGIN_THRESHOLD_DEFAULT)
-    p.add_argument("--top", type=core.arg_int_min(1), default=3, metavar="N",
-                   help="JSON 里保留几个候选（默认 3）")
     p.add_argument("--limit", type=core.arg_int_min(0), default=0, metavar="N",
                    help="最多查询多少题（默认 0 = 全部）")
     p.add_argument("--workers", type=core.arg_int_min(1),
                    default=core.ORIGIN_WORKERS_DEFAULT, metavar="N",
                    help="并发查询数（默认 %d，内部上限 8）"
                    % core.ORIGIN_WORKERS_DEFAULT)
+    p.add_argument("--all", action="store_true",
+                   help="一次性查询本地全部已同步的题目（已缓存的题默认跳过）")
+    p.add_argument("--keyword", help="配合 --all：只查名称含该关键词的比赛")
+    p.add_argument("--phase", choices=["not_started", "running", "ended", "unknown"],
+                   help="配合 --all：只查该状态的比赛")
     p.add_argument("--refresh", action="store_true",
                    help="忽略缓存，重新抓题面并重新查询 CPRet")
-    p.add_argument("--refresh-problems", action="store_true",
-                   help="先重新同步该比赛的题目列表")
     p.add_argument("--json", action="store_true", help="以 JSON 输出查询结果")
     p.set_defaults(handler=cmd_origin, writes=True)
 

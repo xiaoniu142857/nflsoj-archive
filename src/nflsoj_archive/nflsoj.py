@@ -55,7 +55,7 @@ from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, as_complete
                                 wait)
 from functools import lru_cache
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 DEFAULT_API = "https://nflsoi.cc:20035"
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".nflsoj")
@@ -3638,12 +3638,14 @@ def video_resolution(video: dict) -> str:
 
 def fetch_videos(client: "Client", links, base_url: str, limit: int = DEFAULT_VIDEO_LIMIT,
                  console: "Console" = None, with_manifest: bool = True) -> list:
-    """按顺序解析最多 limit 个视频的元信息；单个失败不影响其它。
+    """按顺序解析视频元信息（limit <= 0 表示全部）；单个失败不影响其它。
 
     with_manifest=True 时顺带取几 KB 的 DASH 清单，用于补全时长/分辨率。
     """
     videos = []
-    picked = list(links or [])[: max(0, int(limit))]
+    links = list(links or [])
+    limit = int(limit or 0)
+    picked = links if limit <= 0 else links[:limit]
     for link in picked:
         try:
             meta = client.video_info(link.get("uuid"))
@@ -3978,7 +3980,8 @@ def probe_media_size(client: "Client", url: str, timeout: int = 30):
 def archive_videos(store: Store, console: Console, client: Client, contest_id,
                    description: str, videos_dir: str, limit: int = DEFAULT_VIDEO_LIMIT,
                    download_media: bool = False, max_mb: int = VIDEO_MAX_MB,
-                   force: bool = False, reldir: str = "videos") -> list:
+                   force: bool = False, reldir: str = "videos",
+                   verbose: bool = True) -> list:
     """抓取并保存比赛描述里的讲解视频（默认只抓前 limit 个）。
 
     每个视频保存：
@@ -4061,7 +4064,7 @@ def archive_videos(store: Store, console: Console, client: Client, contest_id,
                     record["downloadedBytes"] += size
                     record["files"].append(reldir + "/" + os.path.basename(target))
                     record["local" + kind.capitalize()] = "%s/%s.%s.mp4" % (reldir, name, kind)
-                    if console is not None:
+                    if console is not None and verbose:
                         console.muted("已下载%s：%s（%s）" % (
                             "视频" if kind == "video" else "音频",
                             os.path.basename(target), format_size(size)))
@@ -4069,7 +4072,7 @@ def archive_videos(store: Store, console: Console, client: Client, contest_id,
                     message = ("%s 文件 %.1f MB，超过 --video-max-mb=%d，已跳过"
                                % (kind, size / 1048576.0, max_mb))
                     record.setdefault("downloadErrors", []).append(message)
-                    if console is not None:
+                    if console is not None and verbose:
                         console.warn("%s：%s" % (record["title"], message))
                 if record.get("downloadErrors"):
                     payload["downloadErrors"] = record["downloadErrors"]
@@ -4082,7 +4085,7 @@ def archive_videos(store: Store, console: Console, client: Client, contest_id,
 
     if any(record.get("downloaded") for record in records):
         helpers = write_decrypt_helper(videos_dir, records)
-        if helpers and console is not None:
+        if helpers and console is not None and verbose:
             console.muted("已生成解密助手：%s（需要 ffmpeg；运行后得到可播放的 mp4）"
                           % "、".join(helpers))
     return records
@@ -5283,153 +5286,116 @@ def origin_threshold(store: Store, args=None) -> float:
     return value
 
 
-def origin_cli(args, store: Store, console: Console, helper) -> int:
-    """把题目送入 CPRet 查询原题；相似度 > 阈值即判为命中，并按 VJudge 题号缓存。
+def origin_pick_problems(entry: dict, specs=None, limit: int = 0, console=None,
+                         tool_name: str = "nflsoj") -> list:
+    """从比赛记录里挑出要查询的题目（按题号/题目 ID），并给出缺失提示。"""
+    problems = [p for p in (entry.get("problems") or []) if isinstance(p, dict)]
+    if specs:
+        picked, missing = [], []
+        for spec in specs:
+            problem = resolve_problem(entry, spec)
+            if problem is None:
+                missing.append(str(spec))
+            else:
+                picked.append(problem)
+        if missing and console is not None:
+            console.error("找不到题号：%s" % "、".join(missing))
+            console.muted("可用 `%s problems %s` 查看题号列表"
+                          % (tool_name, entry.get("id")))
+        problems = picked
+    return limit_take(problems, limit)
 
-    两个工具共用这段逻辑，差异由 helper 提供：
-        helper.pick_contest(store, username, console, spec, quiet)
-        helper.entry(store, username, contest, args)
-        helper.statement(problem, refresh)
-        helper.close()
-    """
-    if getattr(args, "offline", False):
-        console.error("已启用离线模式（--offline），原题查询需要访问 CPRet")
-        console.muted("去掉 --offline 后重试；删掉该参数即可查询")
-        return 1
-    username = store.cached_username()
-    if not username:
-        console.error("本地还没有账号数据")
-        console.muted("请先运行：%s login 然后 %s sync"
-                      % (helper.tool_name, helper.tool_name))
-        return 1
-    contest = helper.pick_contest(store, username, console, args.contest,
-                                  quiet=bool(getattr(args, "json", False)))
-    if contest is None:
-        return 1
-    threshold = origin_threshold(store, args)
-    top = max(1, min(safe_int(getattr(args, "top", 3), 3), 10))
-    workers = max(1, min(clamp_workers(getattr(args, "workers", ORIGIN_WORKERS_DEFAULT)),
-                         8))
-    refresh = bool(getattr(args, "refresh", False))
 
-    try:
-        entry = helper.entry(store, username, contest, args)
-        if entry is None:
-            return 1
-        problems = [p for p in (entry.get("problems") or []) if isinstance(p, dict)]
-        if not problems:
-            console.warn("这场比赛没有题目（讲座类比赛或站点未开放题目列表）")
-            return 0
-        if args.problems:
-            picked, missing = [], []
-            for spec in args.problems:
-                problem = resolve_problem(entry, spec)
-                if problem is None:
-                    missing.append(str(spec))
-                else:
-                    picked.append(problem)
-            problems = picked
-            if missing:
-                console.error("找不到题号：%s" % "、".join(missing))
-                console.muted("可用 `%s problems %s` 查看题号列表"
-                              % (helper.tool_name, entry.get("id")))
-                if not problems:
-                    return 1
-        problems = limit_take(problems, getattr(args, "limit", 0))
+def origin_fetch_statements(store: Store, console: Console, helper, problems,
+                            workers: int = 4, refresh: bool = False,
+                            progress=None):
+    """并发取题面（命中本地缓存则不联网），返回 (statements, errors, 缓存命中数)。"""
+    statements, errors = {}, {}
+    cached_count = 0
+    todo = []
+    for problem in problems:
+        pid = problem.get("problemId")
+        if pid is None:
+            continue
+        if not refresh:
+            cached = store.load_statement(pid, STATEMENT_CACHE_TTL)
+            if cached and cached.get("statement"):
+                statements[str(pid)] = cached["statement"]
+                cached_count += 1
+                continue
+        todo.append(problem)
+    if todo:
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, 8))) as pool:
+            futures = {pool.submit(helper.statement, problem, refresh): problem
+                       for problem in todo}
+            for future in as_completed(futures):
+                problem = futures[future]
+                try:
+                    statement, error = future.result()
+                except Exception as exc:            # noqa: BLE001
+                    statement, error = "", str(exc) or exc.__class__.__name__
+                pid = str(problem.get("problemId"))
+                if statement:
+                    statements[pid] = statement
+                elif error:
+                    errors[pid] = error
+                if progress is not None:
+                    progress.update(1, total=len(todo),
+                                    detail=clean_text(problem.get("title"))[:20])
+    return statements, errors, cached_count
 
-        quiet = bool(getattr(args, "json", False))
-        if not quiet:
-            console.title("原题查询", note="%s · #%s" % (entry.get("name") or "",
-                                                       entry.get("id")))
-            console.kv("账号", username, value_color="bgreen")
-            console.kv("本次查询", "%d 题" % len(problems))
-            console.kv("相似度阈值", "> %.2f（--threshold 可调）" % threshold)
-            console.kv("查询服务", CPRET_API)
-            console.blank()
 
-        # 1) 取题面（并发，命中缓存则不联网）
-        fetch_console = console.stderr() if quiet else console
-        statements, statement_errors = {}, {}
-        to_fetch = [p for p in problems if p.get("problemId") is not None]
-        fetch_progress = None
-        if to_fetch and not quiet:
-            fetch_progress = Progress(fetch_console, "获取题面", total=len(to_fetch)).start_line()
-        try:
-            with ThreadPoolExecutor(max_workers=max(1, min(workers + 2, 8))) as pool:
-                futures = {pool.submit(helper.statement, problem, refresh): problem
-                           for problem in to_fetch}
-                for index, future in enumerate(as_completed(futures), 1):
-                    problem = futures[future]
-                    try:
-                        statement, error = future.result()
-                    except Exception as exc:        # noqa: BLE001
-                        statement, error = "", str(exc)
-                    pid = problem.get("problemId")
-                    if statement:
-                        statements[str(pid)] = statement
-                    elif error:
-                        statement_errors[str(pid)] = error
-                    if fetch_progress is not None:
-                        fetch_progress.update(1, total=len(to_fetch),
-                                             detail=clean_text(problem.get("title"))[:20])
-        finally:
-            if fetch_progress is not None:
-                fetch_progress.close()
+def origin_query_problems(store: Store, console: Console, username: str, contest_id,
+                          problems, statements, errors, threshold: float,
+                          cpret, workers: int = 2, refresh: bool = False,
+                          progress=None, save_every: int = 0) -> dict:
+    """并发查询 CPRet 并把判定写回 progress.json，返回 {pid: record}。"""
+    records = {}
 
-        # 2) 查询 CPRet（并发 + 全局间隔）
-        cpret = CpretClient(timeout=ORIGIN_TIMEOUT, retries=2,
-                            delay=ORIGIN_DELAY_DEFAULT,
-                            debug=bool(getattr(args, "debug", False)))
-        records = {}
-        query_progress = None
-        if not quiet:
-            query_progress = Progress(fetch_console, "查询 CPRet", total=len(problems)).start_line()
-        try:
-            def query_one(problem):
-                pid = problem.get("problemId")
-                statement = statements.get(str(pid)) or ""
-                if not statement:
-                    origin = {"matched": False, "threshold": threshold, "score": None,
-                              "reason": statement_errors.get(str(pid)) or "没有题面"}
-                    return problem, origin, True
-                text = origin_query_text(problem.get("title"), statement)
-                origin, cached = run_origin_search(store, console, cpret, text, threshold,
-                                                   refresh=refresh)
-                origin["queryChars"] = len(text)
-                return problem, origin, cached
+    def query_one(problem):
+        pid = problem.get("problemId")
+        statement = statements.get(str(pid)) or ""
+        if not statement:
+            return problem, {"matched": False, "threshold": threshold, "score": None,
+                             "reason": errors.get(str(pid)) or "没有题面"}, False
+        text = origin_query_text(problem.get("title"), statement)
+        origin, cached = run_origin_search(store, console, cpret, text, threshold,
+                                           refresh=refresh)
+        origin["queryChars"] = len(text)
+        return problem, origin, cached
 
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(query_one, problem): problem for problem in problems}
-                for index, future in enumerate(as_completed(futures), 1):
-                    problem = futures[future]
-                    try:
-                        _, origin, cached = future.result()
-                    except ApiError as exc:
-                        problem, origin, cached = futures[future], {
-                            "matched": False, "threshold": threshold, "score": None,
-                            "reason": exc.message}, True
-                    except Exception as exc:            # noqa: BLE001
-                        problem, origin, cached = futures[future], {
-                            "matched": False, "threshold": threshold, "score": None,
-                            "reason": "%s: %s" % (exc.__class__.__name__, exc)}, True
-                    origin["cached"] = cached
-                    records[str(problem.get("problemId"))] = origin
-                    try:
-                        store.set_origin(username, entry.get("id"),
-                                         problem.get("problemId"), compact_origin(origin))
-                    except Exception:               # noqa: BLE001 记录失败不影响展示
-                        pass
-                    if query_progress is not None:
-                        query_progress.update(1, total=len(problems),
-                                             detail=clean_text(problem.get("title"))[:20])
-        finally:
-            if query_progress is not None:
-                query_progress.close()
-            cpret.close()
-            _safe_save_progress(store, console)
-    finally:
-        helper.close()
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, 8))) as pool:
+        futures = {pool.submit(query_one, problem): problem for problem in problems}
+        for future in as_completed(futures):
+            problem = futures[future]
+            try:
+                _, origin, cached = future.result()
+            except ApiError as exc:
+                origin, cached = {"matched": False, "threshold": threshold,
+                                  "score": None, "reason": exc.message}, True
+            except Exception as exc:                # noqa: BLE001
+                origin, cached = {"matched": False, "threshold": threshold,
+                                  "score": None,
+                                  "reason": "%s: %s" % (exc.__class__.__name__, exc)}, True
+            origin["cached"] = cached
+            records[str(problem.get("problemId"))] = origin
+            # 只缓存真正查询过的结果：拿不到题面（权限/未开始）的题留待下次重试
+            if isinstance(origin.get("score"), (int, float)):
+                try:
+                    store.set_origin(username, contest_id, problem.get("problemId"),
+                                     compact_origin(origin))
+                except Exception:                       # noqa: BLE001
+                    pass
+            if progress is not None:
+                progress.update(1, total=len(problems),
+                                detail=clean_text(problem.get("title"))[:20])
+            if save_every and len(records) % save_every == 0:
+                _safe_save_progress(store, console)
+    return records
 
+
+def origin_report_table(console: Console, problems, records) -> tuple:
+    """打印「题号 / 题目 / 相似度 / 判定 / 原题题号 / 来源」表，返回 (命中数, 缓存数)。"""
     rows, notes, matched_count, cached_count = [], [], 0, 0
     for problem in problems:
         pid = str(problem.get("problemId"))
@@ -5458,10 +5424,101 @@ def origin_cli(args, store: Store, console: Console, helper) -> int:
             (target,),
             (str(origin.get("source") or "-")[:14], "magenta"),
         ])
-    if getattr(args, "json", False):
+    console.table(["题号", "题目", "相似度", "判定", "原题题号", "来源"], rows,
+                  aligns=["right", "left", "right", "center", "left", "left"])
+    for line in notes[:12]:
+        console.out(console.paint(line, "grey"))
+    if len(notes) > 12:
+        console.muted("（还有 %d 条备注未显示）" % (len(notes) - 12))
+    return matched_count, cached_count
+
+
+def origin_cli(args, store: Store, console: Console, helper) -> int:
+    """把题目送入 CPRet 查询原题；相似度 > 阈值即判为命中，并按 VJudge 题号缓存。
+
+    两个工具共用：差异由 helper 提供 pick_contest / entry / statement / close。
+    ``--all`` 对本地全部已同步比赛做一次批量查询（已缓存的题默认跳过）。
+    """
+    if getattr(args, "offline", False):
+        console.error("已启用离线模式（--offline），原题查询需要访问 CPRet")
+        console.muted("去掉 --offline 后重试")
+        return 1
+    username = store.cached_username()
+    if not username:
+        console.error("本地还没有账号数据")
+        console.muted("请先运行：%s login 然后 %s sync"
+                      % (helper.tool_name, helper.tool_name))
+        return 1
+
+    threshold = origin_threshold(store, args)
+    workers = max(1, min(clamp_workers(getattr(args, "workers", ORIGIN_WORKERS_DEFAULT)), 8))
+    refresh = bool(getattr(args, "refresh", False))
+    quiet = bool(getattr(args, "json", False))
+    limit = safe_int(getattr(args, "limit", 0), 0)
+
+    if getattr(args, "all", False):
+        return origin_all_cli(args, store, console, helper, username, threshold,
+                              workers, refresh, quiet, limit)
+
+    contest = helper.pick_contest(store, username, console, args.contest, quiet=quiet)
+    if contest is None:
+        return 1
+    try:
+        entry = helper.entry(store, username, contest, args)
+        if entry is None:
+            return 1
+        problems = origin_pick_problems(entry, args.problems, limit, console,
+                                        helper.tool_name)
+        if not problems:
+            if args.problems:
+                return 1
+            console.warn("这场比赛没有题目（讲座类比赛或站点未开放题目列表）")
+            return 0
+        if not quiet:
+            console.title("原题查询", note="%s · #%s" % (entry.get("name") or "",
+                                                       entry.get("id")))
+            console.kv("账号", username, value_color="bgreen")
+            console.kv("本次查询", "%d 题" % len(problems))
+            console.kv("相似度阈值", "> %.2f（--threshold 可调）" % threshold)
+            console.kv("查询服务", CPRET_API)
+            console.blank()
+        fetch_console = console.stderr() if quiet else console
+
+        fetch_progress = None
+        if not quiet:
+            fetch_progress = Progress(fetch_console, "获取题面",
+                                      total=len(problems)).start_line()
+        try:
+            statements, errors, _cached = origin_fetch_statements(
+                store, console, helper, problems, workers=max(4, workers),
+                refresh=refresh, progress=fetch_progress)
+        finally:
+            if fetch_progress is not None:
+                fetch_progress.close()
+
+        cpret = CpretClient(timeout=ORIGIN_TIMEOUT, retries=2,
+                            delay=ORIGIN_DELAY_DEFAULT,
+                            debug=bool(getattr(args, "debug", False)))
+        query_progress = None
+        if not quiet:
+            query_progress = Progress(fetch_console, "查询 CPRet",
+                                      total=len(problems)).start_line()
+        try:
+            records = origin_query_problems(
+                store, console, username, entry.get("id"), problems, statements, errors,
+                threshold, cpret, workers=workers, refresh=refresh,
+                progress=query_progress)
+        finally:
+            if query_progress is not None:
+                query_progress.close()
+            cpret.close()
+            _safe_save_progress(store, console)
+    finally:
+        helper.close()
+
+    if quiet:
         payload = {"contest": {"id": entry.get("id"), "name": entry.get("name")},
-                   "threshold": threshold,
-                   "cpret": CPRET_API,
+                   "threshold": threshold, "cpret": CPRET_API,
                    "problems": [{
                        "displayOrder": problem.get("displayOrder"),
                        "problemId": problem.get("problemId"),
@@ -5471,24 +5528,154 @@ def origin_cli(args, store: Store, console: Console, helper) -> int:
         console.out(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         return 0
 
-    console.table(["题号", "题目", "相似度", "判定", "原题题号", "来源"], rows,
-                  aligns=["right", "left", "right", "center", "left", "left"])
-    for line in notes[:12]:
-        console.out(console.paint(line, "grey"))
-    if len(notes) > 12:
-        console.muted("（还有 %d 条备注未显示）" % (len(notes) - 12))
+    matched_count, cached_count = origin_report_table(console, problems, records)
     console.blank()
-    total = len(problems)
-    console.ok("命中 %d / %d 题（阈值 > %.2f）" % (matched_count, total, threshold))
+    console.ok("命中 %d / %d 题（阈值 > %.2f）" % (matched_count, len(problems), threshold))
     if cached_count:
         console.muted("其中 %d 题来自本地缓存（--refresh 可重新查询）" % cached_count)
     if matched_count:
-        console.muted("原题题号按 VJudge 格式缓存进 progress.json，形如 洛谷-P1000 / CodeForces-1234A")
+        console.muted("原题题号已按 VJudge 格式缓存（洛谷-P1000 / CodeForces-1234A）")
     unmatched = [p for p in problems
                  if not (records.get(str(p.get("problemId")) or "") or {}).get("matched")]
     if unmatched:
-        console.muted("未命中：%s（可加 --threshold 调整判定，或用 --refresh 重新查询）"
+        console.muted("未命中：%s（可加 --threshold 调整，或用 --refresh 重新查询）"
                       % "、".join(str(p.get("displayOrder")) for p in unmatched[:12]))
+    return 0
+
+
+def origin_all_cli(args, store: Store, console: Console, helper, username: str,
+                   threshold: float, workers: int, refresh: bool, quiet: bool,
+                   limit: int) -> int:
+    """批量：把本地全部已同步的题目一次性送查 CPRet，结果逐题缓存。"""
+    contests = [c for c in store.all_contests(username) if isinstance(c, dict)]
+    keyword = (getattr(args, "keyword", None) or "").strip().lower()
+    if keyword:
+        contests = [c for c in contests if keyword in (c.get("name") or "").lower()]
+    phase = getattr(args, "phase", None)
+    if phase:
+        contests = [c for c in contests
+                    if contest_phase(c.get("startTime"), c.get("endTime"),
+                                     c.get("phase")) == phase]
+    if not contests:
+        console.error("本地还没有比赛数据")
+        console.muted("先运行：%s sync" % helper.tool_name)
+        return 1
+
+    plan, skipped, no_pid = [], 0, 0
+    for contest in contests:
+        entry = store.contest_entry(username, contest.get("id"))
+        if not entry:
+            continue
+        pending = []
+        for problem in [p for p in (entry.get("problems") or []) if isinstance(p, dict)]:
+            pid = problem.get("problemId")
+            if pid is None:
+                no_pid += 1
+                continue
+            cached_origin = problem.get("origin")
+            if (not refresh and isinstance(cached_origin, dict)
+                    and isinstance(cached_origin.get("score"), (int, float))):
+                skipped += 1
+                continue
+            pending.append(problem)
+        if pending:
+            plan.append((entry, pending))
+    total = sum(len(pending) for _entry, pending in plan)
+    if limit:
+        trimmed, remaining = [], limit
+        for entry, pending in plan:
+            if remaining <= 0:
+                break
+            take = pending[:remaining]
+            trimmed.append((entry, take))
+            remaining -= len(take)
+        plan = trimmed
+        total = sum(len(pending) for _entry, pending in plan)
+
+    if not quiet:
+        console.title("原题查询（批量）", note="本地全部比赛")
+        console.kv("账号", username, value_color="bgreen")
+        console.kv("比赛", "%d 场（含待查题目的 %d 场）" % (len(contests), len(plan)))
+        console.kv("待查题目", "%d 题" % total)
+        console.kv("已缓存跳过", "%d 题（--refresh 可重查）" % skipped)
+        console.kv("相似度阈值", "> %.2f" % threshold)
+        console.kv("查询服务", CPRET_API)
+        console.blank()
+    if not total:
+        if quiet:
+            console.out(json.dumps({"threshold": threshold, "queried": 0,
+                                    "matched": 0, "skipped": skipped},
+                                   ensure_ascii=False, indent=2))
+        else:
+            console.ok("全部题目都已查过（%d 题命中缓存），无需再跑" % skipped)
+            console.muted("想重新查询：加 --refresh")
+        return 0
+
+    cpret = CpretClient(timeout=ORIGIN_TIMEOUT, retries=2,
+                        delay=ORIGIN_DELAY_DEFAULT,
+                        debug=bool(getattr(args, "debug", False)))
+    quiet_console = console.stderr()
+    fetch_progress = query_progress = None
+    if not quiet:
+        fetch_progress = Progress(quiet_console, "获取题面", total=total).start_line()
+        query_progress = Progress(quiet_console, "查询 CPRet", total=total).start_line()
+    records_by_contest = {}
+    totals = {"matched": 0, "cached": 0, "queried": 0}
+    started = time.time()
+    try:
+        for index, (entry, pending) in enumerate(plan, 1):
+            statements, errors, _cached = origin_fetch_statements(
+                store, console, helper, pending, workers=max(4, workers),
+                refresh=refresh, progress=fetch_progress)
+            records = origin_query_problems(
+                store, console, username, entry.get("id"), pending, statements, errors,
+                threshold, cpret, workers=workers, refresh=refresh,
+                progress=query_progress, save_every=20)
+            records_by_contest[str(entry.get("id"))] = {"name": entry.get("name"),
+                                                        "problems": records}
+            totals["queried"] += len(records)
+            totals["matched"] += sum(1 for r in records.values() if r.get("matched"))
+            totals["cached"] += sum(1 for r in records.values() if r.get("cached"))
+            _safe_save_progress(store, console)
+    finally:
+        if fetch_progress is not None:
+            fetch_progress.close()
+        if query_progress is not None:
+            query_progress.close()
+        cpret.close()
+        helper.close()
+        _safe_save_progress(store, console)
+
+    elapsed = time.time() - started
+    if quiet:
+        console.out(json.dumps({
+            "threshold": threshold, "queried": totals["queried"],
+            "matched": totals["matched"], "cached": totals["cached"],
+            "skipped": skipped, "elapsed": round(elapsed, 1),
+            "contests": records_by_contest}, ensure_ascii=False, indent=2, default=str))
+        return 0
+
+    console.blank()
+    console.ok("批量完成：查询 %d 题，命中 %d 题，用时 %s"
+               % (totals["queried"], totals["matched"], fmt_seconds(elapsed)))
+    if totals["cached"]:
+        console.muted("其中 %d 题命中 CPRet 结果缓存" % totals["cached"])
+    extra = "，%d 题没有题目 ID" % no_pid if no_pid else ""
+    console.muted("跳过 %d 题（已有结果）%s" % (skipped, extra))
+    no_statement = sum(1 for item in records_by_contest.values()
+                       for r in item["problems"].values()
+                       if not isinstance(r.get("score"), (int, float)))
+    if no_statement:
+        console.muted("其中 %d 题拿不到题面（未开始/无权限），下次运行会自动重试"
+                      % no_statement)
+    misses = [r.get("score") for item in records_by_contest.values()
+              for r in item["problems"].values()
+              if not r.get("matched") and isinstance(r.get("score"), (int, float))]
+    if misses:
+        console.muted("未命中 %d 题（最高分 %.2f ~ %.2f，可用 --threshold 调整）"
+                      % (len(misses), min(misses), max(misses)))
+    console.muted("题号已写入 progress.json；单场明细：%s origin <比赛>"
+                  % helper.tool_name)
     return 0
 
 
@@ -5527,8 +5714,27 @@ def cmd_origin(args, store: Store, console: Console) -> int:
 # ---------------------------------------------------------------------------
 # 命令：videos
 # ---------------------------------------------------------------------------
+def videos_for_contest(client: Client, contest: dict, limit: int = 0,
+                       console: Console = None) -> tuple:
+    """取一场比赛说明里的视频链接并解析元信息，返回 (description, videos)。"""
+    detail = client.contest_detail(contest.get("id"), problems=False,
+                                   description=True, announcements=False)
+    if not isinstance(detail, dict):
+        raise ApiError("服务器返回了非预期的比赛详情结构")
+    description = detail.get("description") or ""
+    links = extract_video_links(description)
+    if not links:
+        return description, []
+    return description, fetch_videos(client, links, client.base_url, limit=limit,
+                                     console=console)
+
+
 def cmd_videos(args, store: Store, console: Console) -> int:
-    """列出 / 抓取某场比赛描述里的讲解视频（默认最多 3 个，避免一次性拉全站）。"""
+    """查看 / 保存 / 下载比赛说明里的讲解视频。
+
+    默认列出全部视频；``--save`` 存元信息与 DASH 清单；``--download`` 连带下载媒体；
+    ``--all`` 对本地全部已同步比赛做一次批量处理（一次性下载全部视频）。
+    """
     if getattr(args, "offline", False):
         console.error("已启用离线模式（--offline），视频信息需要访问站点")
         console.muted("去掉 --offline 后重试")
@@ -5538,100 +5744,233 @@ def cmd_videos(args, store: Store, console: Console) -> int:
         console.error("本地还没有账号数据")
         console.muted("请先运行：nflsoj login 然后 nflsoj sync")
         return 1
-    contest = _pick_contest(store, username, console, args.contest,
-                             quiet=bool(getattr(args, "json", False)))
-    if contest is None:
-        return 1
+
+    quiet = bool(getattr(args, "json", False))
+    limit = safe_int(getattr(args, "limit", 0), 0)      # 0 = 全部
+    download = bool(getattr(args, "download", False))
+    save = bool(getattr(args, "save", False)) or download
+    refresh = bool(getattr(args, "refresh", False)) or bool(getattr(args, "force", False))
+    max_mb = safe_int(getattr(args, "max_mb", VIDEO_MAX_MB), VIDEO_MAX_MB)
+    root = os.path.abspath(os.path.expanduser(args.dir or store.archive_dir))
 
     client = client_for(store, args)
     try:
-        try:
-            detail = client.contest_detail(contest.get("id"), problems=False,
-                                           description=True, announcements=False)
-        except ApiError as exc:
-            return report_error(console, exc)
-        if not isinstance(detail, dict):
-            console.error("服务器返回了非预期的比赛详情结构")
-            return 1
-        description = detail.get("description") or ""
-        links = extract_video_links(description)
-        quiet = bool(getattr(args, "json", False))
-        if not quiet:
-            console.title("讲解视频", note="%s · #%s" % (contest.get("name") or "",
-                                                        contest.get("id")))
-        if not links:
-            if not quiet:
-                console.warn("这场比赛描述里没有找到讲解视频链接")
-                console.muted("视频一般写在「比赛说明」里，形如 [标题](/videoshow/<uuid>)")
-                if description.strip():
-                    console.muted("描述片段：%s" % clean_text(description)[:120])
-            else:
-                console.out(json.dumps([], ensure_ascii=False, indent=2))
-            return 0
-        limit = max(1, min(safe_int(args.limit, DEFAULT_VIDEO_LIMIT), 50))
-        if not quiet:
-            console.kv("描述里的视频", "%d 个" % len(links))
-            console.kv("本次抓取", "前 %d 个（--limit 可调）" % limit)
-            console.blank()
-
-        videos = fetch_videos(client, links, store.api_base, limit=limit,
-                              console=None if quiet else console)
-
-        if quiet:
-            console.out(json.dumps(videos, ensure_ascii=False, indent=2, default=str))
-            return 0
-
-        rows = []
-        for video in videos:
-            rows.append([
-                (str(video.get("order") or ""), "grey"),
-                (video.get("title") or "",),
-                (video_duration(video), "grey"),
-                (video_resolution(video), "grey"),
-                (video.get("status") or "-",
-                 "bgreen" if video.get("status") == "ready" else "yellow"),
-                ("是" if video.get("encrypted") else "否",
-                 "bcyan" if video.get("encrypted") else "grey"),
-                (video.get("error") or video.get("mpdError") or "",
-                 "bred" if (video.get("error") or video.get("mpdError")) else "grey"),
-            ])
-        console.table(["#", "视频", "时长", "分辨率", "状态", "加密", "备注"], rows,
-                      aligns=["right", "left", "right", "left", "left", "center", "left"])
-
-        if args.save:
-            root = os.path.abspath(os.path.expanduser(args.dir or store.archive_dir))
-            videos_dir = os.path.join(root, contest_dir_name(contest), "videos")
-            try:
-                records = archive_videos(
-                    store, console, client, contest.get("id"), description, videos_dir,
-                    limit=limit, download_media=args.download,
-                    max_mb=safe_int(args.max_mb, VIDEO_MAX_MB), force=args.force)
-            except StoreError as exc:
-                console.error(exc.message)
-                if exc.hint:
-                    console.muted(exc.hint)
-                return 1
-            console.blank()
-            downloaded = sum(1 for item in records if item.get("downloaded"))
-            total_bytes = sum(int(item.get("downloadedBytes") or 0) for item in records)
-            console.ok("已保存 %d 个视频的元信息到 %s" % (len(records), videos_dir))
-            if downloaded:
-                console.muted("其中 %d 个下载了媒体文件（共 %s）"
-                              % (downloaded, format_size(total_bytes)))
-            console.muted("每个视频一份 JSON（含 keyHex / 签名地址）+ DASH 清单 .mpd")
-            return 0
-
-        console.blank()
-        console.muted("保存元信息：nflsoj videos %s --save" % contest.get("id"))
-        console.muted("同时下载媒体：nflsoj videos %s --save --download（体积很大）"
-                      % contest.get("id"))
-        console.muted("归档时自动抓取前 %d 个：nflsoj archive %s"
-                      % (DEFAULT_VIDEO_LIMIT, contest.get("id")))
-        if any(video.get("encrypted") for video in videos):
-            console.muted("提示：这些视频是 CENC 加密的 DASH 流，下载到的媒体需按 keyHex 解密后播放")
-        return 0
+        if getattr(args, "all", False):
+            return videos_all(store, console, client, username, root, limit, save,
+                              download, max_mb, refresh, quiet,
+                              keyword=getattr(args, "keyword", None),
+                              phase=getattr(args, "phase", None))
+        return videos_one(store, console, client, username, root, limit, save,
+                          download, max_mb, refresh, quiet, args.contest)
     finally:
         client.close()
+
+
+def videos_one(store: Store, console: Console, client: Client, username: str, root: str,
+               limit: int, save: bool, download: bool, max_mb: int, refresh: bool,
+               quiet: bool, spec) -> int:
+    """单场比赛：列出 / 保存 / 下载讲解视频。"""
+    contest = _pick_contest(store, username, console, spec, quiet=quiet)
+    if contest is None:
+        return 1
+    try:
+        description, videos = videos_for_contest(
+            client, contest, limit=limit, console=None if quiet else console)
+    except ApiError as exc:
+        return report_error(console, exc)
+
+    if not quiet:
+        console.title("讲解视频", note="%s · #%s" % (contest.get("name") or "",
+                                                    contest.get("id")))
+    if not videos:
+        if quiet:
+            console.out(json.dumps([], ensure_ascii=False, indent=2))
+        else:
+            console.warn("这场比赛描述里没有找到讲解视频链接")
+            console.muted("视频一般写在「比赛说明」里，形如 [标题](/videoshow/<uuid>)")
+            if description.strip():
+                console.muted("描述片段：%s" % clean_text(description)[:120])
+        return 0
+
+    if quiet and not save:
+        console.out(json.dumps(videos, ensure_ascii=False, indent=2, default=str))
+        return 0
+    if not quiet:
+        console.kv("描述里的视频", "%d 个%s" % (
+            len(videos), "（全部）" if not limit or limit >= len(videos) else "（前 %d 个）" % limit))
+        console.blank()
+        videos_table(console, videos)
+
+    if not save:
+        console.blank()
+        console.muted("保存元信息：nflsoj videos %s --save" % contest.get("id"))
+        console.muted("下载全部媒体：nflsoj videos %s --download（数十 MB/个）"
+                      % contest.get("id"))
+        console.muted("整个账号一次性下载：nflsoj videos --all --download")
+        if any(video.get("encrypted") for video in videos):
+            console.muted("提示：视频是 CENC 加密的 DASH 分轨，下载后用 decrypt.ps1（需 ffmpeg）解密")
+        return 0
+
+    videos_dir = os.path.join(root, contest_dir_name(contest), "videos")
+    try:
+        records = archive_videos(store, console, client, contest.get("id"), description,
+                                 videos_dir, limit=limit, download_media=download,
+                                 max_mb=max_mb, force=refresh, verbose=not quiet)
+    except StoreError as exc:
+        console.error(exc.message)
+        if exc.hint:
+            console.muted(exc.hint)
+        return 1
+    if quiet:
+        console.out(json.dumps(records, ensure_ascii=False, indent=2, default=str))
+        return 0
+    videos_summary(console, records, videos_dir, download_requested=download,
+                   max_mb=max_mb)
+    return 0
+
+
+def videos_all(store: Store, console: Console, client: Client, username: str, root: str,
+               limit: int, save: bool, download: bool, max_mb: int, refresh: bool,
+               quiet: bool, keyword=None, phase=None) -> int:
+    """批量：对本地全部已同步比赛一次性查看 / 保存 / 下载讲解视频。"""
+    contests = _select_contests(store, username, console, None, keyword, phase)
+    if not contests:
+        console.error("没有匹配的比赛")
+        console.muted("先运行 `nflsoj sync` 同步比赛数据")
+        return 1
+    action = ("下载全部视频" if download else "保存视频元信息" if save else "查看视频")
+    if not quiet:
+        console.title("讲解视频（批量）", note="%s · %d 场" % (action, len(contests)))
+        console.kv("账号", username, value_color="bgreen")
+        console.kv("归档目录", root if save else "（不写入）")
+        if download:
+            console.kv("单文件上限", "%d MB" % max_mb)
+        console.blank()
+
+    progress = None
+    if not quiet:
+        progress = Progress(console.stderr(), "处理比赛", total=len(contests)).start_line()
+    payload, totals = [], {"contests": 0, "videos": 0, "downloaded": 0,
+                          "bytes": 0, "skipped": 0, "failed": 0, "oversize": 0}
+    try:
+        for contest in contests:
+            try:
+                description, videos = videos_for_contest(
+                    client, contest, limit=limit, console=None if quiet else console)
+            except ApiError as exc:
+                totals["failed"] += 1
+                payload.append({"id": contest.get("id"), "name": contest.get("name"),
+                                "error": exc.message})
+                if not quiet:
+                    console.warn("%s：%s" % (contest.get("name") or "", exc.message))
+                continue
+            if not videos:
+                totals["skipped"] += 1
+                payload.append({"id": contest.get("id"), "name": contest.get("name"),
+                                "videos": []})
+                continue
+            totals["contests"] += 1
+            totals["videos"] += len(videos)
+            item = {"id": contest.get("id"), "name": contest.get("name"),
+                    "videos": videos}
+            if save:
+                videos_dir = os.path.join(root, contest_dir_name(contest), "videos")
+                try:
+                    records = archive_videos(
+                        store, console, client, contest.get("id"), description, videos_dir,
+                        limit=limit, download_media=download, max_mb=max_mb,
+                        force=refresh, verbose=False)
+                except StoreError as exc:
+                    totals["failed"] += 1
+                    if not quiet:
+                        console.warn("%s：%s" % (contest.get("name") or "", exc.message))
+                    item["error"] = exc.message
+                else:
+                    for record in records:
+                        if record.get("downloaded"):
+                            totals["downloaded"] += 1
+                            totals["bytes"] += int(record.get("downloadedBytes") or 0)
+                        if record.get("downloadErrors"):
+                            totals["oversize"] += len(record["downloadErrors"])
+                    item["records"] = records
+            payload.append(item)
+            if progress is not None:
+                progress.update(1, total=len(contests),
+                                detail=clean_text(contest.get("name"))[:24])
+    finally:
+        if progress is not None:
+            progress.close()
+
+    if quiet:
+        console.out(json.dumps({"action": action, "totals": totals, "contests": payload},
+                               ensure_ascii=False, indent=2, default=str))
+        return 0
+
+    console.blank()
+    if not totals["videos"]:
+        console.warn("本地 %d 场比赛的描述里都没有讲解视频" % len(contests))
+        return 0
+    if save:
+        console.ok("已处理 %d 场比赛、%d 个视频到 %s"
+                   % (totals["contests"], totals["videos"], root))
+    else:
+        console.ok("共 %d 场比赛、%d 个视频" % (totals["contests"], totals["videos"]))
+    if download:
+        if totals["downloaded"]:
+            console.muted("已下载 %d 个媒体文件（共 %s）"
+                          % (totals["downloaded"], format_size(totals["bytes"])))
+        else:
+            console.warn("没有下载任何媒体文件")
+        if totals["oversize"]:
+            console.muted("%d 个文件超过 --max-mb=%d MB 已跳过（各视频 JSON 里有说明，"
+                          "可调大上限后重跑）" % (totals["oversize"], max_mb))
+    if totals["skipped"]:
+        console.muted("跳过 %d 场（描述里没有视频）" % totals["skipped"])
+    if totals["failed"]:
+        console.warn("失败 %d 场（详情见 --json 输出）" % totals["failed"])
+    if save and download and totals["downloaded"]:
+        console.muted("解密：进入各比赛的 videos/ 目录运行 decrypt.ps1（需要 ffmpeg）")
+    elif save and not download:
+        console.muted("下载媒体：再跑一次 nflsoj videos --all --download")
+    return 0
+
+
+def videos_table(console: Console, videos) -> None:
+    rows = []
+    for video in videos:
+        rows.append([
+            (str(video.get("order") or ""), "grey"),
+            (truncate(video.get("title") or "", 26),),
+            (video_duration(video), "grey"),
+            (video_resolution(video), "grey"),
+            (video.get("status") or "-",
+             "bgreen" if video.get("status") == "ready" else "yellow"),
+            ("是" if video.get("encrypted") else "否",
+             "bcyan" if video.get("encrypted") else "grey"),
+            (truncate(video.get("error") or video.get("mpdError") or "", 20), "bred"),
+        ])
+    console.table(["#", "视频", "时长", "分辨率", "状态", "加密", "备注"], rows,
+                  aligns=["right", "left", "right", "left", "left", "center", "left"])
+
+
+def videos_summary(console: Console, records, videos_dir: str,
+                   download_requested: bool = False, max_mb: int = VIDEO_MAX_MB) -> None:
+    downloaded = sum(1 for item in records if item.get("downloaded"))
+    total_bytes = sum(int(item.get("downloadedBytes") or 0) for item in records)
+    oversize = sum(len(item.get("downloadErrors") or []) for item in records)
+    console.blank()
+    console.ok("已保存 %d 个视频的元信息到 %s" % (len(records), videos_dir))
+    if downloaded:
+        console.muted("其中 %d 个下载了媒体文件（共 %s）"
+                      % (downloaded, format_size(total_bytes)))
+        console.muted("解密助手已生成（decrypt.ps1 / decrypt.sh，需要 ffmpeg）")
+    elif download_requested:
+        console.warn("没有下载任何媒体文件（%d 个超过 --max-mb=%d MB，详见各视频 JSON）"
+                     % (oversize or len(records), max_mb))
+        console.muted("调大上限后重跑：--max-mb %d" % (max_mb * 2))
+    else:
+        console.muted("只存了元信息与 DASH 清单；下载媒体加 --download")
+    console.muted("每个视频一份 JSON（含 keyHex / 签名地址）")
 
 
 # ---------------------------------------------------------------------------
@@ -6124,20 +6463,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(handler=cmd_archive, writes=True)
 
     p = sub.add_parser("videos", parents=[common], aliases=["vid"],
-                       help="查看 / 保存比赛描述里的讲解视频",
+                       help="查看 / 保存 / 下载讲解视频（--all 一次性处理全部）",
                        description="解析「比赛说明」里的讲解视频链接（/videoshow/<uuid>），"
-                                   "查询元信息；默认只查前 %d 个，避免一次拉全站。" % DEFAULT_VIDEO_LIMIT)
-    p.add_argument("contest", help="比赛 ID（或唯一前缀 / 名称关键词）")
-    p.add_argument("--limit", type=arg_int_min(1), default=DEFAULT_VIDEO_LIMIT, metavar="N",
-                   help="最多查询几个视频（默认 %d）" % DEFAULT_VIDEO_LIMIT)
+                                   "查询元信息；--save 存元信息与 DASH 清单，--download 连带下载媒体，"
+                                   "--all 对本地全部已同步比赛做一次批量处理。")
+    p.add_argument("contest", nargs="?", help="比赛 ID（或唯一前缀 / 名称关键词；--all 时省略）")
+    p.add_argument("--all", action="store_true",
+                   help="一次性处理本地全部已同步比赛的视频（配合 --download 下载全部）")
+    p.add_argument("--keyword", help="配合 --all：只处理名称含该关键词的比赛")
+    p.add_argument("--phase", choices=["not_started", "running", "ended", "unknown"],
+                   help="配合 --all：只处理该状态的比赛")
+    p.add_argument("--limit", type=arg_int_min(0), default=0, metavar="N",
+                   help="每场最多处理几个视频（默认 0 = 全部）")
     p.add_argument("--save", action="store_true",
                    help="把元信息与 DASH 清单保存到归档目录")
     p.add_argument("--download", action="store_true",
-                   help="配合 --save 下载音视频原始文件（加密且体积大）")
+                   help="保存并下载音视频原始文件（加密且体积大；隐含 --save）")
     p.add_argument("--max-mb", type=arg_int_min(1), default=VIDEO_MAX_MB, metavar="N",
                    help="单个媒体文件下载上限（默认 %d MB）" % VIDEO_MAX_MB)
-    p.add_argument("--dir", metavar="DIR", help="配合 --save 的归档目录")
-    p.add_argument("--force", action="store_true", help="忽略已有文件，强制重新抓取")
+    p.add_argument("--dir", metavar="DIR", help="归档目录（默认 %s）" % "<数据目录>/archive")
+    p.add_argument("--refresh", "--force", dest="refresh", action="store_true",
+                   help="忽略已有文件，强制重新抓取（--force 为旧写法）")
     p.add_argument("--json", action="store_true", help="以 JSON 输出视频元信息")
     p.set_defaults(handler=cmd_videos, writes=True)
 
@@ -6147,24 +6493,25 @@ def build_parser() -> argparse.ArgumentParser:
                                    "最高相似度 > 阈值（默认 %.2f）时判为命中，"
                                    "并记录成 VJudge 题号（形如 洛谷-P1000、CodeForces-1234A）。"
                                    % ORIGIN_THRESHOLD_DEFAULT)
-    p.add_argument("contest", help="比赛 ID（或唯一前缀 / 名称关键词）")
+    p.add_argument("contest", nargs="?", help="比赛 ID（或唯一前缀 / 名称关键词；--all 时省略）")
     p.add_argument("problems", nargs="*", metavar="题号",
                    help="只查询这些题（题号或题目 ID，可多个；省略则整场）")
     p.add_argument("--threshold", type=arg_float_range(0.0, 1.0), metavar="F",
                    default=ORIGIN_THRESHOLD_DEFAULT,
                    help="相似度阈值，严格大于才算命中（默认 %.2f）"
                    % ORIGIN_THRESHOLD_DEFAULT)
-    p.add_argument("--top", type=arg_int_min(1), default=3, metavar="N",
-                   help="JSON 里保留几个候选（默认 3）")
     p.add_argument("--limit", type=arg_int_min(0), default=0, metavar="N",
                    help="最多查询多少题（默认 0 = 全部）")
     p.add_argument("--workers", type=arg_int_min(1), default=ORIGIN_WORKERS_DEFAULT,
                    metavar="N", help="并发查询数（默认 %d，内部上限 8）"
                    % ORIGIN_WORKERS_DEFAULT)
+    p.add_argument("--all", action="store_true",
+                   help="一次性查询本地全部已同步的题目（已缓存的题默认跳过）")
+    p.add_argument("--keyword", help="配合 --all：只查名称含该关键词的比赛")
+    p.add_argument("--phase", choices=["not_started", "running", "ended", "unknown"],
+                   help="配合 --all：只查该状态的比赛")
     p.add_argument("--refresh", action="store_true",
                    help="忽略缓存，重新抓题面并重新查询 CPRet")
-    p.add_argument("--refresh-problems", action="store_true",
-                   help="先重新同步该比赛的题目列表")
     p.add_argument("--json", action="store_true", help="以 JSON 输出查询结果")
     p.set_defaults(handler=cmd_origin, writes=True)
 
